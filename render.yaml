@@ -1,0 +1,48 @@
+# NEXORA on Render (Blueprint).
+#
+# How to use:
+#   1. Push this file to the repository root.
+#   2. In the Render dashboard: New -> Blueprint -> connect iibnaratul/NEXORA.
+#   3. Render prompts for CODE_ENCRYPTION_KEY (a 64-hex secret, never committed):
+#      generate it with: openssl rand -hex 32
+#      Paste it into Render's dashboard field only, never into chat or git.
+#   4. Render provisions the database + web service, runs migrations
+#      (preDeployCommand) before the first deploy, then health-checks
+#      /api/health and gives the service a public https://*.onrender.com URL.
+#
+# Honest limits of the free tier (checked Oct 2026):
+#   - The free web service spins down after 15 minutes idle and takes
+#     ~1 minute to wake on the next request.
+#   - The free Postgres database expires 30 days after creation, with a
+#     14-day grace period to upgrade before deletion. For permanent data,
+#     upgrade the database to a paid plan (basic-256mb or larger).
+#   - Uploaded files live on the service's local disk and do NOT survive
+#     redeploys or spin-downs on the free tier (no persistent disk).
+#     Chat and delivery data lives in Postgres and is unaffected.
+services:
+  - type: web
+    name: nexora
+    runtime: node
+    region: singapore
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    preDeployCommand: npm run migrate
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TRUST_PROXY
+        value: "true"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: nexora-db
+          property: connectionString
+      - key: CODE_ENCRYPTION_KEY
+        sync: false
+databases:
+  - name: nexora-db
+    region: singapore
+    plan: free
+    databaseName: nexora
+    user: nexora
