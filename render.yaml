@@ -6,9 +6,11 @@
 #   3. Render prompts for CODE_ENCRYPTION_KEY (a 64-hex secret, never committed):
 #      generate it with: openssl rand -hex 32
 #      Paste it into Render's dashboard field only, never into chat or git.
-#   4. Render provisions the database + web service, runs migrations
-#      (preDeployCommand) before the first deploy, then health-checks
+#   4. Render provisions the database + web service, then health-checks
 #      /api/health and gives the service a public https://*.onrender.com URL.
+#      NOTE: the free tier does NOT support preDeployCommand, so migrations
+#      run as part of startCommand instead (migrate.js is idempotent: a
+#      no-op when all migrations are already applied).
 #
 # Honest limits of the free tier (checked Oct 2026):
 #   - The free web service spins down after 15 minutes idle and takes
@@ -26,9 +28,8 @@ services:
     region: singapore
     plan: free
     buildCommand: npm ci
-    startCommand: npm start
+    startCommand: npm run migrate && npm start
     healthCheckPath: /api/health
-    preDeployCommand: npm run migrate
     envVars:
       - key: NODE_ENV
         value: production
