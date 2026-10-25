@@ -1,0 +1,163 @@
+# NEXORA CI + release.
+#
+# On every push to main and every pull request: install, run the full
+# test suite (pg-mem), re-run the integration/e2e suites against real
+# PostgreSQL 16, run the Playwright browser suite against real PostgreSQL,
+# and smoke-test the Docker stack (build, migrate, health check).
+#
+# On a version tag push (v*.*.*): after all test jobs pass, package the
+# application (excluding node_modules, .env, and test artifacts) and
+# publish it as a GitHub Release asset. This is a source release, not a
+# live deployment: hosting the app still needs a platform plus real
+# secrets (DATABASE_URL, CODE_ENCRYPTION_KEY) — see docs/DEPLOYMENT.md.
+# The app has no compile step (plain Node.js ESM), so "build" here means
+# dependency install + tests + packaging.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (pg-mem)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  test-real-pg:
+    name: Tests (real PostgreSQL 16)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nexora
+          POSTGRES_PASSWORD: nexora-dev-only
+          POSTGRES_DB: nexora_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready -U nexora
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install PostgreSQL client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+      - name: Run every suite file against a fresh database
+        env:
+          PGPASSWORD: nexora-dev-only
+          NEXORA_TEST_DATABASE_URL: postgresql://nexora:nexora-dev-only@localhost:5432/nexora_test
+        run: |
+          set -e
+          FAIL=0
+          for f in backend/tests/unit/*.test.js backend/tests/integration/*.test.js e2e/*.test.js; do
+            echo "=== $f (fresh database) ==="
+            dropdb -h localhost -U nexora --if-exists nexora_test
+            createdb -h localhost -U nexora -O nexora nexora_test
+            node --test "$f" || FAIL=1
+          done
+          if [ "$FAIL" = 1 ]; then echo "REAL-PG SUITE: FAILURES PRESENT"; exit 1; fi
+          echo "REAL-PG SUITE: ALL GREEN"
+
+  e2e:
+    name: Browser E2E (Chromium, real PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nexora
+          POSTGRES_PASSWORD: nexora-dev-only
+          POSTGRES_DB: nexora_browser
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready -U nexora
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - name: Confirm the browser suite used real PostgreSQL (not pg-mem fallback)
+        run: grep -q "real-postgresql" tests/browser/artifacts/server.log
+      - name: Upload browser artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: tests/browser/artifacts/
+          if-no-files-found: ignore
+
+  docker-smoke:
+    name: Docker stack smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set a CI-only encryption key (ephemeral, never a real secret)
+        run: echo "CODE_ENCRYPTION_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+      - run: docker compose config -q
+      - run: docker compose up --build -d
+      - name: Run migrations, then verify health + frontend
+        run: |
+          set -e
+          docker compose exec -T app npm run migrate
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:3000/api/health > /dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS http://localhost:3000/api/health
+          curl -fsS http://localhost:3000/ > /dev/null
+      - name: Show compose logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: Shut down the stack
+        if: always()
+        run: docker compose down -v
+
+  release:
+    name: Publish GitHub Release (tags only)
+    runs-on: ubuntu-latest
+    needs: [test, test-real-pg, e2e, docker-smoke]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package the application
+        run: |
+          tar --exclude=node_modules --exclude=.git --exclude=.env \
+              --exclude=test-results --exclude=tests/browser/artifacts \
+              -czf "nexora-${{ github.ref_name }}.tar.gz" .
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            "nexora-${{ github.ref_name }}.tar.gz" \
+            --title "NEXORA ${{ github.ref_name }}" \
+            --notes "Automated source release for ${{ github.ref_name }}. Run it with Docker (see docs/DEPLOYMENT.md): set DATABASE_URL to a real PostgreSQL database and CODE_ENCRYPTION_KEY to a 64-hex-character secret, then docker compose up --build -d && docker compose exec app npm run migrate. This release is not a live deployment."

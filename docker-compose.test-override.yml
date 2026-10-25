@@ -1,0 +1,33 @@
+# TEST-ONLY compose override (Phase 3, 2026-10-25).
+# Usage (isolated project, never the production stack):
+#   docker compose -p nexora-deploy-test \
+#     -f docker-compose.yml -f docker-compose.test-override.yml up --build -d
+#   docker compose -p nexora-deploy-test \
+#     -f docker-compose.yml -f docker-compose.test-override.yml exec app npm run migrate
+#   docker compose -p nexora-deploy-test \
+#     -f docker-compose.yml -f docker-compose.test-override.yml down -v
+# This file changes ONLY test-project ports, database name/password, and
+# CORS_ORIGINS. It does not alter the production service definitions in
+# docker-compose.yml, which remain the production reference.
+# NOTE: in the Phase 3 sandbox this stack could not be started at all
+# (daemon bridge failure + runc setns denial + registry EOF — see
+# docs/DEPLOYMENT.md §4). Re-run the commands above on a real Docker host.
+services:
+  db:
+    environment:
+      POSTGRES_USER: nexora_test
+      POSTGRES_PASSWORD: test-only-change-me
+      POSTGRES_DB: nexora_deploy_test
+    # The base file's healthcheck probes user "nexora"; with the renamed
+    # test user it would never report healthy, so it must be overridden too.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexora_test"]
+    # No host port published: the app reaches the DB over the compose network.
+  app:
+    environment:
+      DATABASE_URL: postgres://nexora_test:test-only-change-me@db:5432/nexora_deploy_test
+      CORS_ORIGINS: http://localhost:3101
+    # !override replaces the base file's "3000:3000" mapping; without it,
+    # compose merges port lists and BOTH 3000 and 3101 would be published.
+    ports: !override
+      - "3101:3000"

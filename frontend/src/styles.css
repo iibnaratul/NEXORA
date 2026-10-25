@@ -1,0 +1,34 @@
+/* NEXORA stylesheet — verbatim the original single-file <style> block, moved
+   to a same-origin file so the style-src 'self' CSP no longer blocks the
+   app's own styling. Appearance is unchanged; only the delivery mechanism
+   moved. The classes at the end replace former inline style attributes
+   (also CSP-blocked) with identical declarations. */
+:root{--bg:#000;--sf:#0e1113;--ln:#232a2e;--tx:#eef3f5;--mu:#8b979e;--li:#c6ff3d;--cy:#22d3ee;--rd:#ff5c6c;--on:#000;color-scheme:dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:light){:root:not([data-theme=dark]){--bg:#f3f6f5;--sf:#fff;--ln:#d5dddb;--tx:#0b1112;--mu:#5b6a70;--li:#3f6b00;--cy:#0e7490;--rd:#c0182d;--on:#fff;color-scheme:light}}
+:root[data-theme=light]{--bg:#f3f6f5;--sf:#fff;--ln:#d5dddb;--tx:#0b1112;--mu:#5b6a70;--li:#3f6b00;--cy:#0e7490;--rd:#c0182d;--on:#fff;color-scheme:light}
+*{box-sizing:border-box}html,body{height:100%;margin:0}body{background:var(--bg);color:var(--tx);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column}
+#app{flex:1;min-height:0;display:flex;flex-direction:column}main{flex:1;min-height:0;overflow:auto;padding:14px;max-width:760px;width:100%;margin:0 auto}
+nav{display:flex;border-top:1px solid var(--ln);background:var(--bg)}nav button{flex:1;padding:10px 4px;background:none;border:0;color:var(--mu);font:inherit;font-size:12px;cursor:pointer}nav button b{display:block;font-size:18px}nav button.on{color:var(--li)}
+@media(min-width:800px){#app{flex-direction:row-reverse}nav{flex-direction:column;width:96px;border:0;border-right:1px solid var(--ln);justify-content:flex-start;padding-top:12px}}
+h1{font-size:13px;letter-spacing:.3em;margin:0 0 12px;color:var(--li)}h1 span{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--li);box-shadow:0 0 10px var(--li);margin-right:8px}h2{font-size:17px;margin:14px 0 8px}
+.c{background:var(--sf);border:1px solid var(--ln);border-radius:14px;padding:12px;margin:0 0 10px;display:block;width:100%;text-align:left;color:inherit;font:inherit}button.c{cursor:pointer}.c small,.mu{color:var(--mu)}small{font-size:12px}
+input,textarea,select{width:100%;background:var(--bg);color:var(--tx);border:1px solid var(--ln);border-radius:10px;padding:10px;font:inherit;margin:4px 0 8px}input:focus,textarea:focus,select:focus,button:focus-visible{outline:2px solid var(--cy)}
+.b{background:var(--li);color:var(--on);border:0;border-radius:10px;padding:10px 14px;font:inherit;font-weight:600;cursor:pointer}.b.g{background:none;color:var(--tx);border:1px solid var(--ln)}.b.r{background:none;color:var(--rd);border:1px solid var(--rd)}
+.row{display:flex;gap:8px;align-items:center}.row>*{flex:0 0 auto}.row>.f{flex:1}.tag{font-size:11px;border:1px solid var(--cy);color:var(--cy);border-radius:99px;padding:1px 8px;margin-left:4px}.tag.w{border-color:var(--rd);color:var(--rd)}
+.av{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;background:var(--sf);border:1px solid var(--li);font-size:16px;flex:none}
+#ml{flex:1;overflow:auto;padding:4px 0}.m{max-width:85%;margin:6px 0;padding:8px 10px;border-radius:12px;background:var(--sf);border:1px solid var(--ln);word-break:break-word}.m.me{margin-left:auto;border-color:var(--li)}.m .re{border-left:2px solid var(--cy);padding-left:6px;color:var(--mu);font-size:12px}
+ol{list-style:none;padding:0;margin:8px 0}li{display:flex;gap:10px;align-items:baseline;padding:4px 0;color:var(--mu)}li i{width:10px;height:10px;border-radius:50%;border:2px solid var(--ln);flex:none}li.on{color:var(--tx)}li.on i{background:var(--li);border-color:var(--li);box-shadow:0 0 8px var(--li)}li.nx i{border-color:var(--cy)}
+.sk{height:56px;border-radius:14px;margin-bottom:10px;background:linear-gradient(90deg,var(--sf),var(--ln),var(--sf));background-size:200% 100%;animation:s 1.2s infinite}@keyframes s{to{background-position:-200% 0}}
+#t{position:fixed;left:50%;transform:translateX(-50%);bottom:84px;background:var(--sf);border:1px solid var(--cy);border-radius:10px;padding:8px 14px;z-index:9;max-width:90%}
+.ban{background:var(--sf);border:1px solid var(--rd);color:var(--rd);border-radius:10px;padding:8px 12px;margin-bottom:10px;font-size:13px}.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--cy);margin-right:6px}
+@media(prefers-reduced-motion:reduce){.sk{animation:none}}
+
+/* Replacements for former inline style attributes (CSP-safe, same values). */
+.col-full{display:flex;flex-direction:column;height:100%}
+.ptr{cursor:pointer}
+.mt8{margin-top:8px}
+.mt6{margin-top:6px}
+.empty-note{text-align:center;margin-top:30px}
+.wauto{width:auto}
+.preview-img{max-width:100%;border-radius:10px}
+.qr-img{background:#fff;border-radius:10px;padding:6px}
