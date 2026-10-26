@@ -65,10 +65,36 @@ export const api = {
   addMember: (id, nexoraId) => req('POST', `/api/conversations/${id}/members`, { nexoraId }),
   removeMember: (id, userId) => req('DELETE', `/api/conversations/${id}/members/${userId}`),
 
+  // --- Community hub (005) ---
+  pins: (id) => req('GET', `/api/conversations/${id}/pins`),
+  pinMessage: (id, messageId) => req('POST', `/api/conversations/${id}/pins`, { messageId }),
+  unpinMessage: (id, messageId) => req('DELETE', `/api/conversations/${id}/pins/${messageId}`),
+  updateGroupRules: (id, rules) => req('PATCH', `/api/conversations/${id}/rules`, { rules }),
+  adminLog: (id) => req('GET', `/api/conversations/${id}/admin-log?limit=50`),
+  transferOwnership: (id, newOwnerId) => req('POST', `/api/conversations/${id}/transfer`, { newOwnerId, confirm: true }),
+  setMemberRole: (id, userId, role) => req('PATCH', `/api/conversations/${id}/members/${userId}/role`, { role }),
+  createInvite: (id, body = {}) => req('POST', `/api/conversations/${id}/invites`, body),
+  listInvites: (id) => req('GET', `/api/conversations/${id}/invites`),
+  inviteQrUrl: (id, code) => `/api/conversations/${id}/invites/${encodeURIComponent(code)}/qr`,
+  joinByCode: (code) => req('POST', '/api/conversations/join-by-code', { code }),
+  createJoinRequest: (id) => req('POST', `/api/conversations/${id}/join-requests`, {}),
+  listJoinRequests: (id) => req('GET', `/api/conversations/${id}/join-requests`),
+  decideJoinRequest: (id, reqId, decision) => req('POST', `/api/conversations/${id}/join-requests/${reqId}/${decision}`, {}),
+
+  // --- Transaction flow / trust (005) ---
+  messageReplies: (id) => req('GET', `/api/messages/${id}/replies`),
+  toggleReaction: (id, emoji) => req('POST', `/api/messages/${id}/reactions`, { emoji }),
+  sharePickupLocation: (id, lat, lng) => req('POST', `/api/deliveries/${id}/share-location`, { lat, lng }),
+  pickupLocation: (id) => req('GET', `/api/deliveries/${id}/pickup-location`),
+  rateDelivery: (id, stars, comment) => req('POST', `/api/deliveries/${id}/ratings`, { stars, comment }),
+  deliveryRatings: (id) => req('GET', `/api/deliveries/${id}/ratings`),
+  userReputation: (id) => req('GET', `/api/users/${id}/reputation`),
+
   uploadToConversation: async (id, file) => {
     const fd = new FormData(); fd.append('file', file);
     return req('POST', `/api/files/conversations/${id}/upload`, fd, { form: true });
   },
+  fileUrl: (id) => req('GET', `/api/files/${encodeURIComponent(id)}/url`),
   uploadParcelPhoto: async (id, file) => {
     const fd = new FormData(); fd.append('file', file);
     return req('POST', `/api/files/deliveries/${id}/photo`, fd, { form: true });
@@ -85,6 +111,26 @@ export const api = {
   cancelDelivery: (id) => req('POST', `/api/deliveries/${id}/cancel`, {}),
   disputeDelivery: (id, reason) => req('POST', `/api/deliveries/${id}/dispute`, { reason }),
   deliveryRoute: (id) => req('GET', `/api/deliveries/${id}/route`),
+
+  // --- Marketplace delivery requests (Phase 1+2 contract) ---
+  // All paths live here so a backend path change is a one-line fix.
+  // NOTE: the parcel-photo upload is the existing private-file endpoint
+  // /api/files/deliveries/:id/photo (see uploadParcelPhoto above), not
+  // /api/deliveries/:id/photo — that shorter path does not exist.
+  deliveryRequests: (conversationId) => req('GET', `/api/delivery-requests?conversationId=${encodeURIComponent(conversationId)}`),
+  deliveryRequest: (id) => req('GET', `/api/delivery-requests/${encodeURIComponent(id)}`),
+  createDeliveryRequest: (body) => req('POST', '/api/delivery-requests', body),
+  acceptDeliveryRequest: (id) => req('POST', `/api/delivery-requests/${encodeURIComponent(id)}/accept`, {}),
+  declineDeliveryRequest: (id) => req('POST', `/api/delivery-requests/${encodeURIComponent(id)}/decline`, {}),
+  cancelDeliveryRequest: (id) => req('POST', `/api/delivery-requests/${encodeURIComponent(id)}/cancel`, {}),
+  updateDeliveryRequest: (id, patch) => req('PATCH', `/api/delivery-requests/${encodeURIComponent(id)}`, patch),
+  updateDeliverySettings: (id, patch) => req('PATCH', `/api/conversations/${encodeURIComponent(id)}/delivery-settings`, patch),
+
+  // --- Marketplace delivery actions (Phase 1+2 contract) ---
+  prepareDelivery: (id) => req('POST', `/api/deliveries/${encodeURIComponent(id)}/prepare`, {}),
+  updateDropoff: (id, patch) => req('PATCH', `/api/deliveries/${encodeURIComponent(id)}/dropoff`, patch),
+  arriveDelivery: (id) => req('POST', `/api/deliveries/${encodeURIComponent(id)}/arrive`, {}),
+  handoverDelivery: (id, code) => req('POST', `/api/deliveries/${encodeURIComponent(id)}/handover`, { code }),
 
   courierRegister: () => req('POST', '/api/couriers/register', {}),
   courierMe: () => req('GET', '/api/couriers/me'),

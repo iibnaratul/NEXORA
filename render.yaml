@@ -41,6 +41,8 @@ services:
           property: connectionString
       - key: CODE_ENCRYPTION_KEY
         sync: false
+      - key: MAPS_PROVIDER
+        value: osrm
 databases:
   - name: nexora-db
     region: singapore

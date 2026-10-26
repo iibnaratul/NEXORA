@@ -12,6 +12,7 @@ import authRouter from './routes/auth.js';
 import usersRouter from './routes/users.js';
 import conversationsRouter, { messagesRouter } from './routes/conversations.js';
 import deliveriesRouter from './routes/deliveries.js';
+import deliveryRequestsRouter from './routes/deliveryRequests.js';
 import filesRouter from './routes/files.js';
 import couriersRouter, { adminRouter } from './routes/couriers.js';
 import healthRouter from './routes/health.js';
@@ -28,7 +29,7 @@ export function createApp() {
         defaultSrc: ["'self'"],
         scriptSrc: ["'self'"],
         styleSrc: ["'self'"],
-        imgSrc: ["'self'", 'data:', 'blob:'],
+        imgSrc: ["'self'", 'data:', 'blob:', 'https://*.tile.openstreetmap.org'],
         connectSrc: ["'self'", 'ws:', 'wss:'],
         objectSrc: ["'none'"],
         baseUri: ["'self'"],
@@ -52,6 +53,7 @@ export function createApp() {
   app.use('/api/conversations', conversationsRouter);
   app.use('/api/messages', messagesRouter);
   app.use('/api/deliveries', deliveriesRouter);
+  app.use('/api/delivery-requests', deliveryRequestsRouter);
   app.use('/api/files', filesRouter);
   app.use('/api/couriers', couriersRouter);
   app.use('/api/admin', adminRouter);

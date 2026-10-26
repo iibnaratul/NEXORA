@@ -231,3 +231,41 @@ silently patched.
   not. Use it for load-balancer health checks; do not use it as a readiness
   gate for migrations — run `npm run migrate` explicitly first.
 - Backups: see `docs/BACKUP_RESTORE.md` (procedure + `scripts/backup-restore-test.sh`).
+
+## 7. Live deployment on Render (2026-10-26)
+
+Live at https://nexora-oaje.onrender.com/ via a Render Blueprint
+(`render.yaml` at the repo root, deployed from `iibnaratul/NEXORA`):
+
+- Web service `nexora`: Node runtime, Singapore region, free plan,
+  `buildCommand: npm ci`, `startCommand: npm run migrate && npm start`,
+  `healthCheckPath: /api/health`, auto-deploy on push to `main`.
+- Database `nexora-db`: PostgreSQL, Singapore region, free plan.
+- Env: `NODE_ENV=production`, `TRUST_PROXY=true` (Render terminates TLS
+  and proxies), `DATABASE_URL` wired from the database via `fromDatabase`
+  (same-region internal URL, so no extra SSL config is needed in `pg`),
+  `CODE_ENCRYPTION_KEY` entered in the Render dashboard only
+  (`sync: false`, never committed).
+- Env (added 2026-10-26): `MAPS_PROVIDER=osrm` in `render.yaml`, so the
+  live site's routing works instead of returning 503. If a Blueprint sync
+  does not apply it to the existing service, add the same variable in the
+  Render dashboard.
+- Why migrations run in `startCommand`: Render's free tier does not
+  support `preDeployCommand`, and free services cannot open a shell or
+  run one-off jobs. `migrate.js` is idempotent, so the restart-time run
+  is a no-op once migrations are applied.
+
+Verified 2026-10-26 from outside the platform:
+
+- `GET /api/health` → `status: ok`, `database: up`, `realtime:
+  socket.io`, `storage: local/configured`; payments/push unconfigured,
+  E2EE off with the TLS note — all as designed.
+- `GET /` → 200, NEXORA welcome page with sign-in / create-account.
+
+Still open (from the original production brief): the free database
+expires 30 days after creation (14-day grace to upgrade) — upgrade to a
+paid plan for permanent data; uploads on local disk do not survive
+redeploys on the free tier (no persistent disk); no error-monitoring
+service is wired yet (Render logs only); no custom domain is configured.
+Public HTTPS itself is now live via Render's managed TLS — the §5
+"public HTTPS UNTESTED" caveat is resolved for this deployment.

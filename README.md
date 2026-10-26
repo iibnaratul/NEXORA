@@ -1,6 +1,6 @@
 # NEXORA
 
-[![CI](https://github.com/iir20/Nexora-beta-0.1/actions/workflows/ci.yml/badge.svg)](https://github.com/iir20/Nexora-beta-0.1/actions/workflows/ci.yml)
+[![CI](https://github.com/ibnaratul2025-hue/NEXORA/actions/workflows/ci.yml/badge.svg)](https://github.com/ibnaratul2025-hue/NEXORA/actions/workflows/ci.yml)
 
 Pseudonymous chat and parcel delivery (**NEXORA TRANSIT**) with a real backend:
 PostgreSQL persistence, cookie sessions, server-side authorization on every
@@ -70,6 +70,22 @@ See `docs/PLAN.md` for the full feature map and the decisions behind it. In shor
   `CANCELLED` and disputes. Courier claim is one atomic `UPDATE … WHERE
   status='SEARCHING_FOR_COURIER'`; handover codes are AES-256-GCM encrypted,
   expiring, attempt-limited, single-use; the QR holds only the order reference.
+  Marketplace orders (2026-10-26) use a separate fulfillment path
+  `CREATED → PREPARED → READY_FOR_PICKUP → DELIVERED` driven by delivery
+  requests created inside chats/groups (see `docs/API.md`); cash-on-pickup
+  is recorded, never charged.
+- **Community hub & trust (2026-10-26)**: group roles Owner/Admin/Moderator/
+  Member with badges; pinned announcements; group rules; admin log;
+  ownership transfer with confirmation; invite links + invite QR; join-
+  request approvals; message threads, reactions, and edited tags; a live
+  delivery status card in chat driven only by the real delivery state;
+  time-limited pickup-only live location (one-shot reading, 30-minute
+  expiry, no tracking, no history); post-delivery ratings with reputation
+  computed live from real data only (never seeded); "Item Exchanged" as the
+  display state for delivered marketplace orders; system messages for
+  arrival and exchange; well-lit-public-place guidance copy (text only).
+  Not built: E2EE, auto-deleting messages, "discreet mode" (see
+  `docs/API.md`).
 
 ## Seed accounts (development only — change immediately)
 
@@ -81,13 +97,16 @@ See `docs/PLAN.md` for the full feature map and the decisions behind it. In shor
 
 - **Maps/GPS routing**: OSRM (routing) + Nominatim (geocoding) are integrated
   behind a provider interface (`backend/src/services/maps/`, see
-  `docs/MAPS.md`) and verified live against the public demo servers, but the
-  default configuration still ships with `MAPS_PROVIDER` empty, so
-  `/api/deliveries/:id/route` returns `503 MAPS_NOT_CONFIGURED` until a
-  provider is configured. Demo servers are rate-capped with no uptime
-  guarantee — production needs a self-hosted or keyed provider. No routes,
-  distances, or ETAs are ever fabricated. Manual areas + optional GPS
-  coordinates are stored.
+  `docs/MAPS.md`) and verified live against the public demo servers. Since
+  2026-10-26 the frontend renders a real map (Leaflet 1.9.4 vendored
+  locally, OpenStreetMap tiles, no key) with a pin picker, and `render.yaml`
+  sets `MAPS_PROVIDER=osrm` for the live deployment so routing works there
+  (if a Blueprint sync misses it on the existing service, set it in the
+  Render dashboard too). Demo servers remain rate-capped with no uptime
+  guarantee — production scale needs a self-hosted or keyed provider (the
+  Google adapter is documented in `docs/MAPS.md`, not implemented — it needs
+  a real Google Cloud key + billing). No routes, distances, or ETAs are
+  ever fabricated. Manual areas + optional GPS coordinates are stored.
 - **Payments**: fees are informational only; nothing is charged.
 - **Push notifications**: in-app notifications table exists; no push channel.
 - **End-to-end encryption**: messages are protected by TLS in production, not
@@ -114,6 +133,22 @@ verified — public HTTPS is untested. An isolated test stack is defined by
 `docker-compose.test-override.yml` (project `-p nexora-deploy-test`, app on
 host port 3101).
 
+## Live deployment (2026-10-26)
+
+NEXORA is live at https://nexora-oaje.onrender.com/ via a Render Blueprint
+(`render.yaml` in the repo root): a free Node web service + free PostgreSQL
+database, both in the Singapore region, auto-deploying on every push to
+`main`. Migrations run via `startCommand` (`npm run migrate && npm start`)
+because Render's free tier does not support `preDeployCommand`. Verified
+2026-10-26: `/api/health` reports `status: ok, database: up` and the
+frontend serves the welcome page.
+
+Free-tier limits (checked Oct 2026): the web service spins down after 15
+minutes idle (~1 minute to wake); the free database expires 30 days after
+creation with a 14-day grace period to upgrade; uploaded files on local
+disk do not survive redeploys. For permanent data, upgrade the database
+to a paid plan.
+
 ## Continuous integration & releases
 
 `.github/workflows/ci.yml` runs on every push to `main` and every pull
@@ -123,10 +158,9 @@ and a Docker stack smoke test (build, migrate, health check). Pushing a
 version tag (`v*.*.*`) additionally publishes a GitHub Release containing
 a source tarball of the app — but only after all test jobs pass.
 
-A Release is **not** a live website: running NEXORA publicly still needs a
-host with PostgreSQL, HTTPS, and real secrets (`DATABASE_URL`,
-`CODE_ENCRYPTION_KEY`). No hosting platform is configured yet; see
-`docs/DEPLOYMENT.md` for the deployment procedure.
+A Release is **not** a live website — but NEXORA is separately deployed
+live at https://nexora-oaje.onrender.com/ via Render (see Deployment
+above and `docs/DEPLOYMENT.md`).
 
 ## Documentation
 

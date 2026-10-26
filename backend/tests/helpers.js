@@ -30,6 +30,14 @@ export async function createTestDb() {
     name: 'char_length', args: ['text'], returns: 'int',
     implementation: (s) => (s === null || s === undefined ? 0 : String(s).length),
   });
+  // Same class of shim: GET /api/conversations (list) uses NULLIF() in its
+  // DM-partner query, which pg-mem does not implement. Real PostgreSQL has
+  // NULLIF natively, so this is a test-emulator gap, not an app bug: without
+  // it the list endpoint 500s on pg-mem whenever a DM partner row exists.
+  db.public.registerFunction({
+    name: 'nullif', args: ['text', 'text'], returns: 'text',
+    implementation: (a, b) => (a === b ? null : a),
+  });
   const files = fs.readdirSync(MIGRATIONS).filter((f) => f.endsWith('.sql')).sort();
   for (const file of files) {
     const sql = fs.readFileSync(path.join(MIGRATIONS, file), 'utf8');

@@ -42,6 +42,13 @@ filesRouter.post('/conversations/:id/upload', requireAuth, requireCsrf, uploadLi
   }));
 
 // Parcel photo for a delivery (sender, before pickup is verified).
+// This is the ONE photo upload route the frontend reuses for marketplace
+// drop-off photos: POST /api/files/deliveries/:id/photo (mounted under
+// /api/files, upload.single('file')). The response field carrying the file
+// id is `id`; the frontend passes that id as dropoffPhotoFileId to
+// PATCH /api/deliveries/:id/dropoff. For marketplace deliveries the upload
+// sets dropoff_photo_file_id (not the courier parcel photo_file_id); for
+// courier deliveries it sets photo_file_id exactly as before.
 filesRouter.post('/deliveries/:id/photo', requireAuth, requireCsrf, uploadLimiter, upload.single('file'),
   asyncHandler(async (req, res) => {
     assertUuid(req.params.id);
@@ -63,7 +70,11 @@ filesRouter.post('/deliveries/:id/photo', requireAuth, requireCsrf, uploadLimite
        VALUES ($1, $2, $3, $4, $5, $6, 'delivery_photo', $7)`,
       [id, req.user.id, safeOriginalName(req.file.originalname), mime, req.file.size, storageKey, d.id],
     );
-    await query('UPDATE deliveries SET photo_file_id = $1, updated_at = now() WHERE id = $2', [id, d.id]);
+    if (d.fulfillment === 'marketplace') {
+      await query('UPDATE deliveries SET dropoff_photo_file_id = $1, updated_at = now() WHERE id = $2', [id, d.id]);
+    } else {
+      await query('UPDATE deliveries SET photo_file_id = $1, updated_at = now() WHERE id = $2', [id, d.id]);
+    }
     res.status(201).json({ ok: true, data: { id, mimeType: mime, downloadUrl: signedDownloadUrl(id) } });
   }));
 

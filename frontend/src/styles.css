@@ -32,3 +32,14 @@ ol{list-style:none;padding:0;margin:8px 0}li{display:flex;gap:10px;align-items:b
 .wauto{width:auto}
 .preview-img{max-width:100%;border-radius:10px}
 .qr-img{background:#fff;border-radius:10px;padding:6px}
+
+/* Leaflet maps (vendored locally). Kept below the toast/app chrome. */
+.map-box{height:280px;border:1px solid var(--ln);border-radius:12px;margin:4px 0 8px;overflow:hidden;background:var(--sf)}
+.map-box .leaflet-container{z-index:0;font:inherit}
+.map-box .leaflet-container a{color:var(--cy)}
+.map-coord{font-size:12px;color:var(--mu)}
+.m.sys{max-width:100%;text-align:center;background:transparent;border-style:dashed;color:var(--mu);font-size:13px}
+.m .rx{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
+.m .rx button{padding:1px 7px;font-size:12px}
+.m .rx button.on{border-color:var(--li)}
+.tag.role{font-size:11px}

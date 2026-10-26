@@ -2,7 +2,8 @@
 // write enforces membership in SQL (see services/authz.js). Messages are
 // persisted, paginated, and broadcast over Socket.IO after insert.
 import { Router } from 'express';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes } from 'node:crypto';
+import QRCode from 'qrcode';
 import { query, withTransaction } from '../db.js';
 import { schemas, validate } from '../validation/schemas.js';
 import {
@@ -35,12 +36,99 @@ function serializeMessage(m) {
     id: m.id, conversationId: m.conversation_id, senderId: m.sender_id,
     senderNexoraId: m.sender_nexora_id, senderName: m.sender_display_name,
     senderAvatar: m.sender_avatar_glyph, body: m.body, replyToId: m.reply_to_id,
-    editedAt: m.edited_at, createdAt: m.created_at,
+    editedAt: m.edited_at, createdAt: m.created_at, isSystem: !!m.is_system,
+    reactions: m.reactions || [], replyCount: m.reply_count ?? 0,
+    parentSnippet: m.parent_snippet || null,
     attachments: (m.attachments || []).map((a) => ({
       id: a.id, mimeType: a.mime_type, originalName: a.original_name,
       downloadUrl: signedDownloadUrl(a.id),
     })),
   };
+}
+
+// Reaction aggregates for a set of messages: [{emoji, count, reacted}]
+// per message, where reacted is whether the viewing user reacted at all
+// (one reaction per user per message, so it is also "reacted with this").
+async function loadReactions(messageIds, viewerId) {
+  if (!messageIds.length) return {};
+  const placeholders = messageIds.map((_, i) => `$${i + 1}`).join(',');
+  const { rows } = await query(
+    `SELECT message_id, emoji, COUNT(*)::int AS n,
+            BOOL_OR(user_id = $${messageIds.length + 1}) AS reacted
+       FROM message_reactions WHERE message_id IN (${placeholders})
+      GROUP BY message_id, emoji`,
+    [...messageIds, viewerId],
+  );
+  const map = {};
+  for (const r of rows) {
+    (map[r.message_id] ||= []).push({ emoji: r.emoji, count: r.n, reacted: !!r.reacted });
+  }
+  return map;
+}
+
+// Reply-thread metadata for a set of messages: reply counts, plus a short
+// snippet of the parent message for messages that are themselves replies.
+async function loadReplyMeta(messages) {
+  const counts = {};
+  const snippets = {};
+  const ids = messages.map((m) => m.id);
+  if (ids.length) {
+    const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
+    const { rows } = await query(
+      `SELECT reply_to_id, COUNT(*)::int AS n FROM messages
+        WHERE reply_to_id IN (${placeholders}) AND deleted_at IS NULL GROUP BY reply_to_id`,
+      ids,
+    );
+    for (const r of rows) counts[r.reply_to_id] = r.n;
+  }
+  const parentIds = [...new Set(messages.map((m) => m.reply_to_id).filter(Boolean))];
+  if (parentIds.length) {
+    const placeholders = parentIds.map((_, i) => `$${i + 1}`).join(',');
+    const { rows } = await query(
+      `SELECT id, body FROM messages WHERE id IN (${placeholders})`,
+      parentIds,
+    );
+    for (const r of rows) snippets[r.id] = String(r.body || '').slice(0, 80);
+  }
+  return messages.map((m) => ({
+    ...m,
+    reply_count: counts[m.id] || 0,
+    parent_snippet: m.reply_to_id ? (snippets[m.reply_to_id] || null) : null,
+  }));
+}
+
+// ---- 005: community-hub helpers ----
+// Role tiers for groups. Moderator: pin/unpin + delete messages. Admin:
+// moderator powers + members, rules, join decisions, admin log. Owner:
+// admin powers + ownership transfer + removing admins. DMs never use these
+// (DM behavior is unchanged); rooms keep their existing owner/admin rules
+// except where a new endpoint is explicitly group-only.
+const GROUP_MOD = ['owner', 'admin', 'moderator'];
+const GROUP_ADMIN = ['owner', 'admin'];
+function requireGroup(conv) {
+  if (conv.type !== 'group') throw forbidden('This feature is for private groups only');
+}
+async function logGroup(q, conversationId, actorId, action, targetId, detail = {}) {
+  const queryFn = typeof q === 'function' ? q : (t, p) => query(t, p);
+  await queryFn(
+    'INSERT INTO group_admin_log (id, conversation_id, actor_id, action, target_id, detail) VALUES ($1, $2, $3, $4, $5, $6::jsonb)',
+    [randomUUID(), conversationId, actorId, action, targetId || null, JSON.stringify(detail)],
+  );
+}
+const INVITE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function newInviteCode() {
+  let code = 'INV-';
+  for (const b of randomBytes(12)) code += INVITE_CHARS[b % INVITE_CHARS.length];
+  return code;
+}
+
+async function serializeMessagesWithMeta(rows, viewerId) {
+  const withMeta = await loadReplyMeta(rows);
+  const reactions = await loadReactions(rows.map((r) => r.id), viewerId);
+  const attachments = await loadAttachments(rows.map((r) => r.id));
+  return withMeta.map((r) => serializeMessage({
+    ...r, reactions: reactions[r.id] || [], attachments: attachments[r.id] || [],
+  }));
 }
 
 async function loadAttachments(messageIds) {
@@ -180,6 +268,15 @@ conversationsRouter.post('/', requireCsrf, asyncHandler(async (req, res) => {
   res.status(201).json({ ok: true, data: { id: conv.id } });
 }));
 
+async function getDeliverySettingsRow(conversationId) {
+  const { rows } = await query(
+    'SELECT enabled, allow_requests FROM conversation_delivery_settings WHERE conversation_id = $1',
+    [conversationId],
+  );
+  if (!rows.length) return { enabled: true, allowRequests: 'any_member' };
+  return { enabled: rows[0].enabled, allowRequests: rows[0].allow_requests };
+}
+
 conversationsRouter.get('/:id', asyncHandler(async (req, res) => {
   const conv = await getConversationOr404(req.params.id);
   await requireConversationAccess(conv, req.user);
@@ -189,7 +286,44 @@ conversationsRouter.get('/:id', asyncHandler(async (req, res) => {
       WHERE cm.conversation_id = $1 ORDER BY cm.joined_at`,
     [conv.id],
   );
-  res.json({ ok: true, data: { ...conv, members: members.rows } });
+  // Frontend alignment: deliverySettings is the canonical field name
+  // ({ enabled, allowRequests }); delivery_settings carries the same object.
+  // 005: rules/joinMode aliases for the group settings view.
+  const deliverySettings = await getDeliverySettingsRow(conv.id);
+  res.json({ ok: true, data: { ...conv, members: members.rows, deliverySettings, delivery_settings: deliverySettings, rules: conv.rules || '', joinMode: conv.join_mode || 'approval' } });
+}));
+
+// PATCH /api/conversations/:id/delivery-settings — group: owner/admin only;
+// DM: either participant; room: owner/admin members only. When enabled is
+// false, POST /api/delivery-requests for this conversation returns 403, so
+// the frontend can hide/disable the request action from deliverySettings.
+conversationsRouter.patch('/:id/delivery-settings', requireCsrf, asyncHandler(async (req, res) => {
+  const conv = await getConversationOr404(req.params.id);
+  const { rows } = await query(
+    'SELECT role FROM conversation_members WHERE conversation_id = $1 AND user_id = $2',
+    [conv.id, req.user.id],
+  );
+  if (!rows.length) throw forbidden('You are not a member of this conversation');
+  if (conv.type !== 'dm' && !['owner', 'admin'].includes(rows[0].role)) {
+    throw forbidden('Only group owners/admins can change delivery settings');
+  }
+  const body = validate(schemas.deliverySettings, req.body);
+  const current = await getDeliverySettingsRow(conv.id);
+  const enabled = body.enabled !== undefined ? body.enabled : current.enabled;
+  const allowRequests = body.allowRequests !== undefined ? body.allowRequests : current.allowRequests;
+  await query(
+    `INSERT INTO conversation_delivery_settings (conversation_id, enabled, allow_requests, updated_at)
+     VALUES ($1, $2, $3, now())
+     ON CONFLICT (conversation_id) DO UPDATE SET enabled = $2, allow_requests = $3, updated_at = now()`,
+    [conv.id, enabled, allowRequests],
+  );
+  await audit(query, req.user.id, 'conversation.delivery_settings', 'conversation', conv.id, { enabled, allowRequests });
+  // 005: delivery-settings changes are part of the group admin log.
+  if (conv.type === 'group') {
+    await logGroup(query, conv.id, req.user.id, 'delivery_settings_changed', null, { enabled, allowRequests });
+  }
+  const deliverySettings = { enabled, allowRequests };
+  res.json({ ok: true, data: { deliverySettings, delivery_settings: deliverySettings } });
 }));
 
 conversationsRouter.post('/:id/join', requireCsrf, asyncHandler(async (req, res) => {
@@ -245,8 +379,7 @@ conversationsRouter.get('/:id/messages', asyncHandler(async (req, res) => {
       ORDER BY m.created_at DESC LIMIT $3 OFFSET $4`,
     params,
   );
-  const attachments = await loadAttachments(rows.map((r) => r.id));
-  const data = rows.map((r) => serializeMessage({ ...r, attachments: attachments[r.id] || [] }));
+  const data = await serializeMessagesWithMeta(rows, req.user.id);
   const total = await query(
     'SELECT COUNT(*)::int AS n FROM messages WHERE conversation_id = $1 AND deleted_at IS NULL', [conv.id],
   );
@@ -267,9 +400,11 @@ conversationsRouter.post('/:id/messages', requireCsrf, messageLimiter, asyncHand
     }
   }
   if (body.replyToId) {
-    const parent = await query('SELECT id FROM messages WHERE id = $1 AND conversation_id = $2 AND deleted_at IS NULL',
+    const parent = await query('SELECT id, is_system FROM messages WHERE id = $1 AND conversation_id = $2 AND deleted_at IS NULL',
       [body.replyToId, conv.id]);
     if (!parent.rows.length) throw badRequest('Reply target is not in this conversation');
+    // System messages are announcements, not reply targets.
+    if (parent.rows[0].is_system) throw badRequest('System messages cannot be replied to');
   }
   if (body.attachmentIds.length) {
     const placeholders = body.attachmentIds.map((_, i) => `$${i + 1}`).join(',');
@@ -338,7 +473,7 @@ conversationsRouter.post('/:id/members', requireCsrf, asyncHandler(async (req, r
   const conv = await getConversationOr404(req.params.id);
   const { role } = await requireConversationAccess(conv, req.user);
   if (conv.type !== 'group') throw forbidden('Members can only be added to private groups');
-  if (!['owner', 'admin'].includes(role)) throw forbidden('Only group owners/admins can add members');
+  if (!GROUP_ADMIN.includes(role)) throw forbidden('Only group owners/admins can add members');
   const body = validate(schemas.addMember, req.body);
   const member = await resolveUserByNexora(body.nexoraId);
   if (!member) throw notFound('No user with that NEXORA ID');
@@ -348,6 +483,7 @@ conversationsRouter.post('/:id/members', requireCsrf, asyncHandler(async (req, r
     [conv.id, member.id],
   );
   await audit(query, req.user.id, 'conversation.member_added', 'conversation', conv.id, { member: body.nexoraId });
+  await logGroup(query, conv.id, req.user.id, 'member_added', member.id, { nexoraId: body.nexoraId });
   res.json({ ok: true, data: { added: body.nexoraId } });
 }));
 
@@ -357,12 +493,18 @@ conversationsRouter.delete('/:id/members/:userId', requireCsrf, asyncHandler(asy
   assertUuid(req.params.userId);
   const targetId = req.params.userId;
   const isSelf = targetId === req.user.id;
-  if (!isSelf && !['owner', 'admin'].includes(role)) throw forbidden('Only owners/admins can remove members');
+  // 005 permission matrix: moderators never remove others; admins never
+  // remove the owner or a fellow admin (only the owner may remove admins);
+  // the owner may remove anyone except the last owner.
+  if (!isSelf && !GROUP_ADMIN.includes(role)) throw forbidden('Only owners/admins can remove members');
   if (!isSelf && conv.type === 'dm') throw forbidden('DM members cannot be removed');
   const target = await query(
     'SELECT role FROM conversation_members WHERE conversation_id = $1 AND user_id = $2', [conv.id, targetId],
   );
   if (!target.rows.length) throw notFound('That user is not a member');
+  if (!isSelf && role === 'admin' && ['owner', 'admin'].includes(target.rows[0].role)) {
+    throw forbidden('Admins cannot remove the owner or a fellow admin');
+  }
   if (target.rows[0].role === 'owner') {
     const others = await query(
       `SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND role = 'owner' AND user_id <> $2 LIMIT 1`,
@@ -373,8 +515,298 @@ conversationsRouter.delete('/:id/members/:userId', requireCsrf, asyncHandler(asy
   await query('DELETE FROM conversation_members WHERE conversation_id = $1 AND user_id = $2', [conv.id, targetId]);
   await kickFromConversation(req, targetId, conv.id);
   await audit(query, req.user.id, 'conversation.member_removed', 'conversation', conv.id, {});
+  if (conv.type === 'group') await logGroup(query, conv.id, req.user.id, 'member_removed', targetId, {});
   res.json({ ok: true, data: { removed: true } });
 }));
+
+// PATCH /api/conversations/:id/members/:userId/role — group only.
+// Owner: any member to admin/moderator/member (never own role; use transfer
+// for ownership, and an owner's role is never changed directly). Admin: a
+// member/moderator to moderator/member only — never to admin, never
+// touching an owner or fellow admin. Moderators cannot change roles.
+conversationsRouter.patch('/:id/members/:userId/role', requireCsrf, asyncHandler(async (req, res) => {
+  const conv = await getConversationOr404(req.params.id);
+  requireGroup(conv);
+  const { role } = await requireConversationAccess(conv, req.user);
+  assertUuid(req.params.userId);
+  const body = validate(schemas.memberRole, req.body);
+  if (!GROUP_ADMIN.includes(role)) throw forbidden('Only owners/admins can change member roles');
+  const targetId = req.params.userId;
+  if (targetId === req.user.id) throw badRequest('Use ownership transfer to change your own role');
+  const target = await query(
+    'SELECT role FROM conversation_members WHERE conversation_id = $1 AND user_id = $2', [conv.id, targetId],
+  );
+  if (!target.rows.length) throw notFound('That user is not a member');
+  if (target.rows[0].role === 'owner') throw badRequest('An owner\'s role cannot be changed directly — transfer ownership instead');
+  if (role === 'admin' && (body.role === 'admin' || target.rows[0].role === 'admin')) {
+    throw forbidden('Admins cannot promote to admin or change a fellow admin');
+  }
+  await query(
+    'UPDATE conversation_members SET role = $3 WHERE conversation_id = $1 AND user_id = $2',
+    [conv.id, targetId, body.role],
+  );
+  await audit(query, req.user.id, 'conversation.role_changed', 'conversation', conv.id, { target: targetId, role: body.role });
+  await logGroup(query, conv.id, req.user.id, 'role_changed', targetId, { from: target.rows[0].role, to: body.role });
+  res.json({ ok: true, data: { userId: targetId, role: body.role } });
+}));
+
+// ---- 005: pinned announcements (group only, moderator+) ----
+conversationsRouter.get('/:id/pins', asyncHandler(async (req, res) => {
+  const conv = await getConversationOr404(req.params.id);
+  requireGroup(conv);
+  await requireConversationAccess(conv, req.user);
+  const { rows } = await query(
+    `SELECT m.*, u.nexora_id AS sender_nexora_id, u.display_name AS sender_display_name,
+            u.avatar_glyph AS sender_avatar_glyph, p.pinned_by, p.pinned_at
+       FROM pinned_messages p JOIN messages m ON m.id = p.message_id
+       JOIN users u ON u.id = m.sender_id
+      WHERE p.conversation_id = $1 AND m.deleted_at IS NULL
+      ORDER BY p.pinned_at DESC`,
+    [conv.id],
+  );
+  const data = await serializeMessagesWithMeta(rows, req.user.id);
+  res.json({ ok: true, data: data.map((d, i) => ({ ...d, pinnedBy: rows[i].pinned_by, pinnedAt: rows[i].pinned_at })) });
+}));
+
+conversationsRouter.post('/:id/pins', requireCsrf, asyncHandler(async (req, res) => {
+  const conv = await getConversationOr404(req.params.id);
+  requireGroup(conv);
+  const { role } = await requireConversationAccess(conv, req.user);
+  if (!GROUP_MOD.includes(role)) throw forbidden('Only moderators and above can pin messages');
+  const body = validate(schemas.pinMessage, req.body);
+  const msg = await query('SELECT id FROM messages WHERE id = $1 AND conversation_id = $2 AND deleted_at IS NULL',
+    [body.messageId, conv.id]);
+  if (!msg.rows.length) throw notFound('Message not found in this conversation');
+  const existing = await query('SELECT id FROM pinned_messages WHERE message_id = $1', [body.messageId]);
+  if (existing.rows.length) throw conflict('Message is already pinned');
+  await query(
+    'INSERT INTO pinned_messages (id, conversation_id, message_id, pinned_by) VALUES ($1, $2, $3, $4)',
+    [randomUUID(), conv.id, body.messageId, req.user.id],
+  );
+  await logGroup(query, conv.id, req.user.id, 'message_pinned', body.messageId, {});
+  res.status(201).json({ ok: true, data: { pinned: body.messageId } });
+}));
+
+conversationsRouter.delete('/:id/pins/:messageId', requireCsrf, asyncHandler(async (req, res) => {
+  const conv = await getConversationOr404(req.params.id);
+  requireGroup(conv);
+  const { role } = await requireConversationAccess(conv, req.user);
+  if (!GROUP_MOD.includes(role)) throw forbidden('Only moderators and above can unpin messages');
+  assertUuid(req.params.messageId);
+  const del = await query(
+    'DELETE FROM pinned_messages WHERE conversation_id = $1 AND message_id = $2 RETURNING id',
+    [conv.id, req.params.messageId],
+  );
+  if (!del.rows.length) throw notFound('That message is not pinned');
+  await logGroup(query, conv.id, req.user.id, 'message_unpinned', req.params.messageId, {});
+  res.json({ ok: true, data: { unpinned: true } });
+}));
+
+// ---- 005: group rules (admin+) ----
+conversationsRouter.patch('/:id/rules', requireCsrf, asyncHandler(async (req, res) => {
+  const conv = await getConversationOr404(req.params.id);
+  requireGroup(conv);
+  const { role } = await requireConversationAccess(conv, req.user);
+  if (!GROUP_ADMIN.includes(role)) throw forbidden('Only owners/admins can edit group rules');
+  const body = validate(schemas.groupRules, req.body);
+  await query('UPDATE conversations SET rules = $2, updated_at = now() WHERE id = $1', [conv.id, body.rules]);
+  await logGroup(query, conv.id, req.user.id, 'rules_changed', null, {});
+  res.json({ ok: true, data: { rules: body.rules } });
+}));
+
+// ---- 005: admin log (admin+) ----
+conversationsRouter.get('/:id/admin-log', asyncHandler(async (req, res) => {
+  const conv = await getConversationOr404(req.params.id);
+  requireGroup(conv);
+  const { role } = await requireConversationAccess(conv, req.user);
+  if (!GROUP_ADMIN.includes(role)) throw forbidden('Only owners/admins can view the admin log');
+  const { page, limit, offset } = parsePagination(req);
+  const { rows } = await query(
+    `SELECT l.*, u.nexora_id AS actor_nexora_id, u.display_name AS actor_display_name
+       FROM group_admin_log l LEFT JOIN users u ON u.id = l.actor_id
+      WHERE l.conversation_id = $1 ORDER BY l.created_at DESC LIMIT $2 OFFSET $3`,
+    [conv.id, limit, offset],
+  );
+  const total = await query('SELECT COUNT(*)::int AS n FROM group_admin_log WHERE conversation_id = $1', [conv.id]);
+  res.json({ ok: true, data: rows, meta: pageMeta(page, limit, total.rows[0].n) });
+}));
+
+// ---- 005: ownership transfer (owner only, explicit confirm) ----
+conversationsRouter.post('/:id/transfer', requireCsrf, asyncHandler(async (req, res) => {
+  const conv = await getConversationOr404(req.params.id);
+  requireGroup(conv);
+  const { role } = await requireConversationAccess(conv, req.user);
+  if (role !== 'owner') throw forbidden('Only the owner can transfer ownership');
+  const body = validate(schemas.transferOwnership, req.body);
+  if (body.newOwnerId === req.user.id) throw badRequest('You already own this group');
+  const target = await query(
+    'SELECT role FROM conversation_members WHERE conversation_id = $1 AND user_id = $2', [conv.id, body.newOwnerId],
+  );
+  if (!target.rows.length) throw badRequest('The new owner must be a member of the group');
+  await withTransaction(async (client) => {
+    const q = (t, p) => client.query(t, p);
+    await q('UPDATE conversation_members SET role = \'admin\' WHERE conversation_id = $1 AND user_id = $2',
+      [conv.id, req.user.id]);
+    await q('UPDATE conversation_members SET role = \'owner\' WHERE conversation_id = $1 AND user_id = $2',
+      [conv.id, body.newOwnerId]);
+    await logGroup(q, conv.id, req.user.id, 'ownership_transferred', body.newOwnerId, { previousRole: target.rows[0].role });
+    await audit(q, req.user.id, 'conversation.ownership_transferred', 'conversation', conv.id, {});
+  });
+  res.json({ ok: true, data: { newOwnerId: body.newOwnerId, previousOwnerNow: 'admin' } });
+}));
+
+// ---- 005: invite links (admin+ creates; any member may fetch the QR,
+// because the code is meant to be shared — non-members never see it) ----
+conversationsRouter.post('/:id/invites', requireCsrf, asyncHandler(async (req, res) => {
+  const conv = await getConversationOr404(req.params.id);
+  requireGroup(conv);
+  const { role } = await requireConversationAccess(conv, req.user);
+  if (!GROUP_ADMIN.includes(role)) throw forbidden('Only owners/admins can create invite links');
+  const body = validate(schemas.createInvite, req.body);
+  let code = null;
+  for (let attempt = 0; attempt < 5 && !code; attempt++) {
+    const candidate = newInviteCode();
+    const clash = await query('SELECT 1 FROM group_invites WHERE code = $1', [candidate]);
+    if (!clash.rows.length) code = candidate;
+  }
+  if (!code) throw badRequest('Could not generate a unique invite code — try again');
+  const { rows } = await query(
+    `INSERT INTO group_invites (id, code, conversation_id, created_by, expires_at, max_uses)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [randomUUID(), code, conv.id, req.user.id,
+     body.expiresAt ? new Date(body.expiresAt).toISOString() : null,
+     body.maxUses ?? null],
+  );
+  await logGroup(query, conv.id, req.user.id, 'invite_created', rows[0].id, {});
+  res.status(201).json({ ok: true, data: rows[0] });
+}));
+
+conversationsRouter.get('/:id/invites', asyncHandler(async (req, res) => {
+  const conv = await getConversationOr404(req.params.id);
+  requireGroup(conv);
+  const { role } = await requireConversationAccess(conv, req.user);
+  if (!GROUP_ADMIN.includes(role)) throw forbidden('Only owners/admins can list invite links');
+  const { rows } = await query(
+    'SELECT * FROM group_invites WHERE conversation_id = $1 ORDER BY created_at DESC', [conv.id],
+  );
+  res.json({ ok: true, data: rows });
+}));
+
+// Invite QR: PNG encoding ONLY the invite code (same qrcode library and
+// approach as the delivery order QR). It authorizes nothing by itself —
+// joining still runs the expiry/uses checks in /join-by-code.
+conversationsRouter.get('/:id/invites/:code/qr', asyncHandler(async (req, res) => {
+  const conv = await getConversationOr404(req.params.id);
+  requireGroup(conv);
+  await requireConversationAccess(conv, req.user);
+  const { rows } = await query(
+    'SELECT code FROM group_invites WHERE conversation_id = $1 AND code = $2', [conv.id, req.params.code],
+  );
+  if (!rows.length) throw notFound('Invite not found');
+  const png = await QRCode.toBuffer(rows[0].code, { type: 'png', margin: 1, width: 240 });
+  res.type('png').send(png);
+}));
+
+// POST /api/conversations/join-by-code — any authenticated user. Expired
+// codes answer 410, exhausted codes 403; neither ever performs a silent join.
+conversationsRouter.post('/join-by-code', requireCsrf, asyncHandler(async (req, res) => {
+  const body = validate(schemas.joinByCode, req.body);
+  const { rows } = await query('SELECT * FROM group_invites WHERE code = $1', [body.code]);
+  if (!rows.length) throw notFound('Invite code not found');
+  const invite = rows[0];
+  if (invite.expires_at && new Date(invite.expires_at) < new Date()) {
+    const err = new Error('This invite link has expired'); err.status = 410; err.code = 'INVITE_EXPIRED'; throw err;
+  }
+  if (invite.max_uses !== null && invite.uses >= invite.max_uses) {
+    throw forbidden('This invite link has reached its maximum uses');
+  }
+  const member = await query(
+    'SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2',
+    [invite.conversation_id, req.user.id],
+  );
+  if (member.rows.length) return res.json({ ok: true, data: { joined: true, alreadyMember: true, conversationId: invite.conversation_id } });
+  const claimed = await query(
+    `UPDATE group_invites SET uses = uses + 1 WHERE id = $1
+       AND (max_uses IS NULL OR uses < max_uses) RETURNING id`,
+    [invite.id],
+  );
+  if (!claimed.rows.length) throw forbidden('This invite link has reached its maximum uses');
+  await query(
+    'INSERT INTO conversation_members (conversation_id, user_id, role) VALUES ($1, $2, \'member\') ON CONFLICT DO NOTHING',
+    [invite.conversation_id, req.user.id],
+  );
+  await logGroup(query, invite.conversation_id, req.user.id, 'member_joined_via_invite', req.user.id, {});
+  res.json({ ok: true, data: { joined: true, conversationId: invite.conversation_id } });
+}));
+
+// ---- 005: join requests (groups only; approval by admin+) ----
+// Join mode is 'approval' by default (conversations.join_mode); direct-add
+// by owner/admin and invite-code joins keep working regardless of mode,
+// and rooms keep their existing direct-join behavior untouched.
+conversationsRouter.post('/:id/join-requests', requireCsrf, asyncHandler(async (req, res) => {
+  const conv = await getConversationOr404(req.params.id);
+  requireGroup(conv);
+  const member = await query(
+    'SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2',
+    [conv.id, req.user.id],
+  );
+  if (member.rows.length) throw badRequest('You are already a member of this group');
+  const pending = await query(
+    'SELECT id FROM group_join_requests WHERE conversation_id = $1 AND requester_id = $2 AND status = \'REQUESTED\'',
+    [conv.id, req.user.id],
+  );
+  if (pending.rows.length) throw conflict('You already have a pending join request for this group');
+  const { rows } = await query(
+    'INSERT INTO group_join_requests (id, conversation_id, requester_id) VALUES ($1, $2, $3) RETURNING *',
+    [randomUUID(), conv.id, req.user.id],
+  );
+  res.status(201).json({ ok: true, data: rows[0] });
+}));
+
+conversationsRouter.get('/:id/join-requests', asyncHandler(async (req, res) => {
+  const conv = await getConversationOr404(req.params.id);
+  requireGroup(conv);
+  const { role } = await requireConversationAccess(conv, req.user);
+  if (!GROUP_ADMIN.includes(role)) throw forbidden('Only owners/admins can view join requests');
+  const { rows } = await query(
+    `SELECT r.*, u.nexora_id AS requester_nexora_id, u.display_name AS requester_display_name
+       FROM group_join_requests r JOIN users u ON u.id = r.requester_id
+      WHERE r.conversation_id = $1 ORDER BY r.created_at DESC`,
+    [conv.id],
+  );
+  res.json({ ok: true, data: rows });
+}));
+
+async function decideJoinRequest(req, res, approve) {
+  const conv = await getConversationOr404(req.params.id);
+  requireGroup(conv);
+  const { role } = await requireConversationAccess(conv, req.user);
+  if (!GROUP_ADMIN.includes(role)) throw forbidden('Only owners/admins can decide join requests');
+  assertUuid(req.params.requestId);
+  const { rows } = await query(
+    'SELECT * FROM group_join_requests WHERE id = $1 AND conversation_id = $2', [req.params.requestId, conv.id],
+  );
+  if (!rows.length) throw notFound('Join request not found');
+  const jr = rows[0];
+  if (jr.status !== 'REQUESTED') throw badRequest(`Join request is already ${jr.status}`);
+  const updated = await withTransaction(async (client) => {
+    const q = (t, p) => client.query(t, p);
+    if (approve) {
+      await q('INSERT INTO conversation_members (conversation_id, user_id, role) VALUES ($1, $2, \'member\') ON CONFLICT DO NOTHING',
+        [conv.id, jr.requester_id]);
+    }
+    const { rows: out } = await q(
+      `UPDATE group_join_requests SET status = $3, decided_by = $4, updated_at = now()
+        WHERE id = $1 AND conversation_id = $2 RETURNING *`,
+      [jr.id, conv.id, approve ? 'APPROVED' : 'DECLINED', req.user.id],
+    );
+    await logGroup(q, conv.id, req.user.id, approve ? 'join_approved' : 'join_declined', jr.requester_id, {});
+    return out[0];
+  });
+  res.json({ ok: true, data: updated });
+}
+conversationsRouter.post('/:id/join-requests/:requestId/approve', requireCsrf, asyncHandler((req, res) => decideJoinRequest(req, res, true)));
+conversationsRouter.post('/:id/join-requests/:requestId/decline', requireCsrf, asyncHandler((req, res) => decideJoinRequest(req, res, false)));
 
 // ---- messagesRouter: edit / delete (mounted at /api/messages) ----
 export const messagesRouter = Router();
@@ -386,6 +818,8 @@ messagesRouter.patch('/:id', requireCsrf, asyncHandler(async (req, res) => {
   const { rows } = await query('SELECT * FROM messages WHERE id = $1 AND deleted_at IS NULL', [req.params.id]);
   if (!rows.length) throw notFound('Message not found');
   const msg = rows[0];
+  // System messages (arrival/exchange announcements) are never editable.
+  if (msg.is_system) throw forbidden('System messages cannot be edited');
   // Membership is checked before authorship: a removed member must not edit
   // even their own messages (previously author-only, membership unchecked).
   const conv = await getConversationOr404(msg.conversation_id);
@@ -400,19 +834,83 @@ messagesRouter.delete('/:id', requireCsrf, asyncHandler(async (req, res) => {
   const { rows } = await query('SELECT * FROM messages WHERE id = $1 AND deleted_at IS NULL', [req.params.id]);
   if (!rows.length) throw notFound('Message not found');
   const msg = rows[0];
+  // System messages are never deletable by users.
+  if (msg.is_system) throw forbidden('System messages cannot be deleted');
   const conv = await getConversationOr404(msg.conversation_id);
   // Membership first (forSend = must currently be a member): a removed
   // author must not delete even their own message, and a removed admin
   // must not delete others' messages either.
   const { role } = await requireConversationAccess(conv, req.user, { forSend: true });
   let allowed = msg.sender_id === req.user.id;
-  if (!allowed && ['group', 'room'].includes(conv.type)) {
+  if (!allowed && conv.type === 'group') {
+    // 005: moderators join owners/admins for message deletion in groups.
+    allowed = ['owner', 'admin', 'moderator'].includes(role);
+  } else if (!allowed && conv.type === 'room') {
     allowed = ['owner', 'admin'].includes(role);
   }
   if (!allowed) throw forbidden('Only the author or a group admin can delete a message');
   await query('UPDATE messages SET deleted_at = now() WHERE id = $1', [msg.id]);
   await audit(query, req.user.id, 'message.deleted', 'message', msg.id, {});
   res.json({ ok: true, data: { deleted: true } });
+}));
+
+// ---- 005: reply threads + reactions (mounted at /api/messages) ----
+// GET /api/messages/:id/replies — participants only. Returns the parent
+// message plus its replies (oldest first), each with reaction aggregates.
+messagesRouter.get('/:id/replies', asyncHandler(async (req, res) => {
+  assertUuid(req.params.id);
+  const { rows } = await query('SELECT * FROM messages WHERE id = $1 AND deleted_at IS NULL', [req.params.id]);
+  if (!rows.length) throw notFound('Message not found');
+  const parent = rows[0];
+  const conv = await getConversationOr404(parent.conversation_id);
+  await requireConversationAccess(conv, req.user);
+  const { rows: replies } = await query(
+    `SELECT m.*, u.nexora_id AS sender_nexora_id, u.display_name AS sender_display_name,
+            u.avatar_glyph AS sender_avatar_glyph
+       FROM messages m JOIN users u ON u.id = m.sender_id
+      WHERE m.reply_to_id = $1 AND m.deleted_at IS NULL ORDER BY m.created_at ASC`,
+    [parent.id],
+  );
+  const parentFull = await query(
+    `SELECT m.*, u.nexora_id AS sender_nexora_id, u.display_name AS sender_display_name,
+            u.avatar_glyph AS sender_avatar_glyph FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.id = $1`,
+    [parent.id],
+  );
+  const all = [parentFull.rows[0], ...replies];
+  const serialized = await serializeMessagesWithMeta(all, req.user.id);
+  res.json({ ok: true, data: { parent: serialized[0], replies: serialized.slice(1) } });
+}));
+
+// POST /api/messages/:id/reactions — toggle. Same emoji removes the
+// reaction; a different emoji replaces it (one reaction per user per
+// message). System messages reject with 400, as specified.
+messagesRouter.post('/:id/reactions', requireCsrf, messageLimiter, asyncHandler(async (req, res) => {
+  const body = validate(schemas.messageReaction, req.body);
+  assertUuid(req.params.id);
+  const { rows } = await query('SELECT * FROM messages WHERE id = $1 AND deleted_at IS NULL', [req.params.id]);
+  if (!rows.length) throw notFound('Message not found');
+  const msg = rows[0];
+  if (msg.is_system) throw badRequest('System messages cannot receive reactions');
+  const conv = await getConversationOr404(msg.conversation_id);
+  await requireConversationAccess(conv, req.user);
+  const existing = await query(
+    'SELECT emoji FROM message_reactions WHERE message_id = $1 AND user_id = $2', [msg.id, req.user.id],
+  );
+  let action;
+  if (existing.rows.length && existing.rows[0].emoji === body.emoji) {
+    await query('DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2', [msg.id, req.user.id]);
+    action = 'removed';
+  } else if (existing.rows.length) {
+    await query('UPDATE message_reactions SET emoji = $3 WHERE message_id = $1 AND user_id = $2',
+      [msg.id, req.user.id, body.emoji]);
+    action = 'replaced';
+  } else {
+    await query('INSERT INTO message_reactions (message_id, user_id, emoji) VALUES ($1, $2, $3)',
+      [msg.id, req.user.id, body.emoji]);
+    action = 'added';
+  }
+  const reactions = await loadReactions([msg.id], req.user.id);
+  res.json({ ok: true, data: { action, reactions: reactions[msg.id] || [] } });
 }));
 
 export default conversationsRouter;

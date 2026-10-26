@@ -22,7 +22,7 @@ import { MapsError, assertCoordinates, assertQuery, OSM_ATTRIBUTION } from './pr
 export const DEFAULT_ROUTE_BASE_URL = 'https://router.project-osrm.org';
 export const DEFAULT_GEOCODE_BASE_URL = 'https://nominatim.openstreetmap.org';
 export const DEFAULT_TIMEOUT_MS = 5000;
-export const USER_AGENT = 'NEXORA/1.0 (maps; https://github.com/iir20/Nexora-beta-0.1)';
+export const USER_AGENT = 'NEXORA/1.0 (maps; https://github.com/ibnaratul2025-hue/NEXORA)';
 
 export function mapsTimeoutMs() {
   const v = Number(process.env.MAPS_TIMEOUT_MS);

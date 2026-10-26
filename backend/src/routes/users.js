@@ -7,21 +7,33 @@ import { query } from '../db.js';
 import { schemas, validate } from '../validation/schemas.js';
 import { ok, asyncHandler, badRequest, notFound } from '../utils/helpers.js';
 import { requireAuth, requireCsrf } from '../middleware/auth.js';
-import { audit } from '../services/authz.js';
+import { audit, assertUuid } from '../services/authz.js';
+import { reputationOf } from './deliveries.js';
 
 export const usersRouter = Router();
 usersRouter.use(requireAuth);
 
+// 005: reputation computed live from real data only — no stored score.
+// avgStars is null with no ratings (never 0-as-a-score, never a default);
+// completedDeliveries counts real DELIVERED participant rows.
+usersRouter.get('/:id/reputation', asyncHandler(async (req, res) => {
+  assertUuid(req.params.id);
+  const { rows } = await query('SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL', [req.params.id]);
+  if (!rows.length) throw notFound('User not found');
+  res.json({ ok: true, data: { userId: rows[0].id, ...(await reputationOf(rows[0].id)) } });
+}));
+
 // Public profile lookup by NEXORA ID (used to start DMs / add group members).
 usersRouter.get('/by-nexora/:nexoraId', asyncHandler(async (req, res) => {
   const { rows } = await query(
-    `SELECT u.nexora_id, u.display_name, u.avatar_glyph, p.bio
+    `SELECT u.id, u.nexora_id, u.display_name, u.avatar_glyph, p.bio
        FROM users u LEFT JOIN public_profiles p ON p.user_id = u.id
       WHERE u.nexora_id = $1 AND u.deleted_at IS NULL`,
     [req.params.nexoraId],
   );
   if (!rows.length) throw notFound('No user with that NEXORA ID');
-  res.json({ ok: true, data: rows[0] });
+  const reputation = await reputationOf(rows[0].id);
+  res.json({ ok: true, data: { ...rows[0], reputation } });
 }));
 
 usersRouter.patch('/me', requireCsrf, asyncHandler(async (req, res) => {

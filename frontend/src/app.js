@@ -4,18 +4,22 @@
 // The only localStorage keys left are the theme preference (harmless) and
 // nothing else. Session lives in an HttpOnly cookie.
 import { api, initCsrf } from './api.js';
+import { mountPinPicker, mountPinsMap, mountGpsButton, directionsUrl, fmt } from './map.js';
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const T = (t) => new Date(t).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 
-const STATES = ['CREATED', 'SEARCHING_FOR_COURIER', 'ASSIGNED', 'ACCEPTED', 'PICKUP_VERIFIED', 'IN_TRANSIT', 'DROPOFF_VERIFIED', 'DELIVERED'];
+const STATES = ['CREATED', 'PREPARED', 'READY_FOR_PICKUP', 'SEARCHING_FOR_COURIER', 'ASSIGNED', 'ACCEPTED', 'PICKUP_VERIFIED', 'IN_TRANSIT', 'DROPOFF_VERIFIED', 'DELIVERED'];
 const STATE_LABEL = {
-  CREATED: 'Created', SEARCHING_FOR_COURIER: 'Looking for courier', ASSIGNED: 'Courier assigned',
+  CREATED: 'Created', PREPARED: 'Prepared by seller', READY_FOR_PICKUP: 'Ready for pickup', SEARCHING_FOR_COURIER: 'Looking for courier', ASSIGNED: 'Courier assigned',
   ACCEPTED: 'Accepted by courier', PICKUP_VERIFIED: 'Picked up', IN_TRANSIT: 'In transit',
   DROPOFF_VERIFIED: 'Drop-off verified', DELIVERED: 'Delivered', CANCELLED: 'Cancelled',
 };
 const CANCELLABLE = ['CREATED', 'SEARCHING_FOR_COURIER', 'ASSIGNED', 'ACCEPTED'];
+// Marketplace DELIVERED renders as "Item Exchanged" everywhere; courier
+// orders keep "Delivered". List rows carry fulfillment (SELECT *).
+function stateTag(x) { return (x && x.fulfillment === 'marketplace' && x.status === 'DELIVERED') ? 'Item Exchanged' : (STATE_LABEL[x.status] || x.status); }
 const GL = ['◈', '⬡', '✦', '⌬', '◬', '⎔', '✧', '⟁'];
 
 let me = null, backendDown = false, health = null;
@@ -27,6 +31,10 @@ const S = {
   form: null, off: !navigator.onLine, unread: 0, courier: null, codes: null,
   history: null, routeNote: null, route: null, photoFile: null, photoPreview: null,
   pickupLoc: null, dropoffLoc: null, busy: false, confirmDelete: false,
+  requests: null, reqShowForm: false, reqEdit: null, reqTarget: null,
+  dropoffPick: null, dropoffPhotoFile: null, dropoffArea: '',
+  pins: null, thread: null, glog: null, invites: null, joinReqs: null,
+  statusCard: null, pickupShare: null, confirmTransfer: null,
 };
 let socket = null;
 
@@ -102,7 +110,10 @@ function authView(v) {
 function listView(v) {
   const rs = S.convs;
   v.innerHTML = `<h1><span></span>NEXORA</h1>${banner()}
-  <div class="row"><h2 class="f">Chats</h2><button class="b" data-a="nr">+ New</button></div>` +
+  <div class="row"><h2 class="f">Chats</h2><button class="b" data-a="nr">+ New</button></div>
+  <div class="c"><small>Join a private group with an invite code, or request to join a group by its ID (an owner/admin approves).</small>
+  <div class="row"><input id="jc-code" class="f" maxlength="32" placeholder="Invite code, e.g. INV-…" aria-label="Invite code"><button class="b g" data-a="joincode">Join with code</button></div>
+  <div class="row"><input id="jr-id" class="f" placeholder="Group ID" aria-label="Group ID"><button class="b g" data-a="groupjoinreq">Request to join</button></div></div>` +
     (S.form === 'conv' ? `<div class="c">
       <label>Type<select id="cf-type"><option value="room">Public room</option><option value="group">Private group</option><option value="dm">Direct message</option></select></label>
       <input id="cf-name" maxlength="40" placeholder="Name (room / group)" aria-label="Name">
@@ -119,7 +130,8 @@ function convView() {
   $('#v').innerHTML = `<div class="col-full">
   <div class="row"><button class="b g" data-a="back" aria-label="Back">←</button><div class="f"><b>${esc(convTitle(r))}</b><br><small>${r.type === 'room' ? 'Public room' : r.type === 'group' ? 'Private group' : 'Private conversation'}</small></div>
   ${r.type !== 'dm' ? `<button class="b g" data-a="leave">Leave</button>` : ''}</div>
-  ${banner()}<div id="ml" aria-live="polite"></div><div id="rp"></div>
+  ${banner()}<div id="pins"></div><div id="statuscard"></div><div id="ml" aria-live="polite"></div><div id="thread"></div><div id="rp"></div>
+  <div id="dset"></div><div id="reqs"></div><div id="gset"></div>
   <div class="row"><input id="in" class="f" maxlength="2000" placeholder="Message as ${esc(me.displayName || me.nexoraId)}" aria-label="Message">
   <label class="b g ptr">📎<input id="af" type="file" hidden></label>
   <button class="b" data-a="send">Send</button></div>
@@ -143,14 +155,25 @@ function draw() {
     : !S.msgs.length ? '<div class="mu empty-note">No messages yet. Say hello.</div>'
     : S.msgs.map((m) => {
       const mine = m.senderId === me.id, o = S.sel === m.id;
+      if (m.isSystem) {
+        // System announcements (arrival / exchange): distinct, and never
+        // editable, deletable, reactable or replyable — no action buttons.
+        return `<div class="m sys"><small>◆ ${esc(m.body)}</small></div>`;
+      }
       const body = S.editing === m.id
         ? `<input id="ed" class="f" maxlength="2000" value="${esc(m.body)}"><button class="b" data-a="saveedit" data-id="${m.id}">Save</button>`
         : `<div>${esc(m.body)}</div>`;
       const atts = (m.attachments || []).map((a) =>
         `<div><small>📎 <a href="${esc(a.downloadUrl)}" target="_blank" rel="noopener">${esc(a.originalName)}</a></small></div>`).join('');
+      const rx = (m.reactions || []).map((r) =>
+        `<button class="b g ${r.reacted ? 'on' : ''}" data-a="react" data-id="${m.id}" data-e="${esc(r.emoji)}">${esc(r.emoji)} ${r.count}</button>`).join('');
       return `<div class="m ${mine ? 'me' : ''}" data-a="sel" data-id="${m.id}"><small>${esc(m.senderName || m.senderNexoraId)} · ${T(m.createdAt)}${m.editedAt ? ' · edited' : ''}</small>
-        ${m.replyToId ? `<div class="re">reply</div>` : ''}${body}${atts}
+        ${m.replyToId && m.parentSnippet ? `<div class="re">↩ ${esc(m.parentSnippet)}</div>` : (m.replyToId ? '<div class="re">reply</div>' : '')}${body}${atts}
+        ${rx ? `<div class="rx">${rx}</div>` : ''}
+        ${m.replyCount ? `<div><button class="b g" data-a="thread" data-id="${m.id}">Thread (${m.replyCount})</button></div>` : ''}
         ${o ? `<div class="row mt6"><button class="b g" data-a="reply" data-id="${m.id}">Reply</button>
+          <button class="b g" data-a="react" data-id="${m.id}" data-e="👍">👍</button><button class="b g" data-a="react" data-id="${m.id}" data-e="❤️">❤️</button><button class="b g" data-a="react" data-id="${m.id}" data-e="😂">😂</button>
+          ${S.conv?.type === 'group' ? `<button class="b g" data-a="pin" data-id="${m.id}">Pin</button>` : ''}
           ${mine ? `<button class="b g" data-a="edit" data-id="${m.id}">Edit</button><button class="b r" data-a="del" data-id="${m.id}">Delete</button>`
             : `<button class="b r" data-a="block" data-h="${esc(m.senderNexoraId)}">Block</button>`}</div>` : ''}</div>`;
     }).join('')
@@ -158,6 +181,205 @@ function draw() {
   if (near) ml.scrollTop = ml.scrollHeight;
   $('#rp').innerHTML = S.reply ? `<small>Replying to ${esc(S.reply.senderName || S.reply.senderNexoraId)}: ${esc(S.reply.body.slice(0, 50))} <a href="#" data-a="xr">✕</a></small>`
     : (S.pendingAttachment ? `<small>📎 Attached: ${esc(S.pendingAttachmentName)} — send a message to deliver it.</small>` : '');
+  renderThread();
+}
+
+// ---------- delivery requests (marketplace, Phase 1+2) ----------
+// Backend contract (built in parallel): GET /api/conversations/:id returns
+// deliverySettings { enabled, allowRequests }; requests live under
+// /api/delivery-requests. Field names are read defensively (camelCase or
+// snake_case) because the backend shape is not yet live to check against.
+// A missing deliverySettings object is treated as enabled (backwards
+// compatible with conversations created before the field existed).
+function dsetOf(conv) {
+  const d = conv?.deliverySettings || conv?.delivery_settings;
+  if (!d) return { enabled: true, allowRequests: true };
+  return { enabled: d.enabled !== false, allowRequests: d.allowRequests !== false };
+}
+function reqStatus(r) { return String(r.status || r.state || 'pending').toLowerCase(); }
+function reqRequesterId(r) { return r.requesterId || r.requester_id || r.requester?.id; }
+function reqTargetId(r) { return r.targetId || r.target_id || r.sellerId || r.seller_id || r.target?.id; }
+function reqPriceMinor(r) { return r.priceMinor ?? r.price_minor ?? r.price ?? null; }
+function canManageDset(conv) {
+  if (!conv) return false;
+  if (conv.type === 'dm') return true; // either participant
+  if (conv.type === 'group') {
+    const mine = (conv.members || []).find((m) => m.id === me?.id);
+    return mine && (mine.role === 'owner' || mine.role === 'admin');
+  }
+  return false;
+}
+function renderDset() {
+  const box = $('#dset'); if (!box || !S.conv) return;
+  const d = dsetOf(S.conv);
+  if (S.conv.type === 'room') { box.innerHTML = ''; return; }
+  if (!canManageDset(S.conv)) {
+    box.innerHTML = d.enabled ? '' : '<div class="c mu"><small>Delivery requests are disabled for this conversation.</small></div>';
+    return;
+  }
+  box.innerHTML = `<div class="c"><b>Delivery requests</b><br>
+    <label><input id="ds-en" type="checkbox" class="wauto" ${d.enabled ? 'checked' : ''}> Enable delivery requests for this conversation</label><br>
+    <small>Any member may request a parcel or product. Requests are listed below; nothing is ordered or paid in-app.</small><br>
+    <button class="b g" data-a="dsetsave">Save delivery settings</button></div>`;
+}
+function renderRequests() {
+  const box = $('#reqs'); if (!box || !S.conv) return;
+  const conv = S.conv, d = dsetOf(conv);
+  if (conv.type === 'room') { box.innerHTML = ''; return; }
+  const others = (conv.members || []).filter((m) => m.id !== me?.id);
+  const dmTarget = conv.type === 'dm' ? others[0] : null;
+  const reqBtn = d.enabled
+    ? `<button class="b g" data-a="reqform">${S.reqShowForm ? 'Hide request form' : 'Request parcel / product'}</button>`
+    : `<button class="b g" disabled title="Delivery requests are disabled for this conversation">Request parcel / product (disabled)</button>`;
+  const form = !S.reqShowForm || !d.enabled ? '' : `<div class="c">
+    <label>Title<input id="rq-title" maxlength="60" placeholder="What do you need delivered?"></label>
+    <label>Description<textarea id="rq-desc" maxlength="500" placeholder="Details for the seller"></textarea></label>
+    ${conv.type === 'group' ? `<label>Ask (seller)<select id="rq-target">${others.map((m) => `<option value="${esc(m.id)}">${esc(m.display_name || m.nexora_id)}</option>`).join('')}</select></label>` : ''}
+    <label>Price in minor units (optional)<input id="rq-price" type="number" min="0" step="1" placeholder="e.g. 50000"></label>
+    <label>Note (optional)<input id="rq-note" maxlength="200"></label>
+    <button class="b" data-a="reqcreate">Send request</button> <button class="b g" data-a="reqform">Cancel</button><br>
+    <small>Price is recorded in minor units with no currency assumed. No money moves in-app; payment, if any, is settled outside the app and recorded after delivery.</small></div>`;
+  const list = S.requests === null ? '<div class="sk"></div>'
+    : !S.requests.length ? '<div class="c mu"><small>No delivery requests in this conversation yet.</small></div>'
+    : S.requests.map((r) => {
+      const st = reqStatus(r), isSeller = reqTargetId(r) === me?.id, isRequester = reqRequesterId(r) === me?.id;
+      const pending = ['pending', 'open', 'requested'].includes(st);
+      const accepted = ['accepted', 'approved', 'confirmed'].includes(st);
+      const deliveryId = r.deliveryId || r.delivery_id;
+      const editForm = S.reqEdit === r.id && pending && (isSeller || isRequester)
+        ? `<div class="row"><input id="rq-eprice" type="number" min="0" step="1" value="${reqPriceMinor(r) ?? ''}" placeholder="Price (minor units)" aria-label="Price"><input id="rq-enote" maxlength="200" value="${esc(r.note || '')}" placeholder="Note" aria-label="Note"><button class="b" data-a="reqsave" data-id="${esc(r.id)}">Save</button></div>` : '';
+      return `<div class="c"><b>${esc(r.title)}</b> <span class="tag">${esc(st)}</span><br>
+        <small>${esc(r.description || '')}${reqPriceMinor(r) != null ? `<br>Price: ${esc(reqPriceMinor(r))} (minor units)` : ''}${r.note ? `<br>Note: ${esc(r.note)}` : ''}</small><br>
+        <div class="row mt6">
+        ${isSeller && pending ? `<button class="b" data-a="reqaccept" data-id="${esc(r.id)}">Accept</button><button class="b g" data-a="reqdecline" data-id="${esc(r.id)}">Decline</button>` : ''}
+        ${isRequester && (pending || accepted) ? `<button class="b r" data-a="reqcancel" data-id="${esc(r.id)}">Cancel</button>` : ''}
+        ${(isSeller || isRequester) && pending ? `<button class="b g" data-a="reqedit" data-id="${esc(r.id)}">Edit price / note</button>` : ''}
+        ${deliveryId ? `<button class="b g" data-a="od" data-id="${esc(deliveryId)}">View delivery</button>` : ''}
+        </div>${editForm}</div>`;
+    }).join('');
+  box.innerHTML = `<div class="row mt8"><h2 class="f">Delivery requests</h2>${reqBtn}</div>${form}${list}`;
+}
+async function loadRequests() {
+  if (!S.conv || S.conv.type === 'room') return;
+  renderDset(); renderRequests();
+  try { S.requests = (await api.deliveryRequests(S.conv.id)).data; }
+  catch (e) {
+    // The backend builds these endpoints in parallel: a 404 here means the
+    // endpoint is not live yet, not that requests are empty. Say so plainly.
+    S.requests = e.status === 404 ? [] : S.requests;
+    if (e.status === 404) toast('Delivery requests are not available yet (backend endpoint not live).');
+    else toast(e.message);
+  }
+  renderDset(); renderRequests();
+  await renderStatusCard();
+  await loadGroupExtras();
+}
+
+// ---------- community hub + transaction flow (005) ----------
+const ROLE_BADGE = { owner: 'Owner', admin: 'Admin', moderator: 'Moderator', member: 'Member' };
+function myRole(conv) {
+  return (conv?.members || []).find((m) => m.id === me?.id)?.role || null;
+}
+function renderPins() {
+  const box = $('#pins'); if (!box || !S.conv) return;
+  if (S.conv.type !== 'group') { box.innerHTML = ''; return; }
+  const mod = ['owner', 'admin', 'moderator'].includes(myRole(S.conv));
+  if (!S.pins?.length) { box.innerHTML = ''; return; }
+  box.innerHTML = `<div class="c"><b>📌 Pinned announcements</b>${S.pins.map((p) => `<div class="row"><span class="f"><small>${esc(p.senderName || p.senderNexoraId)}: ${esc(p.body.slice(0, 120))}</small></span>${mod ? `<button class="b g" data-a="unpin" data-id="${p.id}">Unpin</button>` : ''}</div>`).join('')}</div>`;
+}
+function renderThread() {
+  const box = $('#thread'); if (!box) return;
+  if (!S.thread) { box.innerHTML = ''; return; }
+  const { parent, replies } = S.thread;
+  box.innerHTML = `<div class="c"><div class="row"><b class="f">Thread</b><button class="b g" data-a="threadx">Close</button></div>
+    <div><small>${esc(parent.senderName || parent.senderNexoraId)}: ${esc(parent.body)}</small></div>
+    ${replies.map((r) => `<div class="m"><small>${esc(r.senderName || r.senderNexoraId)} · ${T(r.createdAt)}${r.editedAt ? ' · edited' : ''}</small><div>${esc(r.body)}</div></div>`).join('') || '<div class="mu"><small>No replies yet.</small></div>'}
+    <div class="row"><input id="th-in" class="f" maxlength="2000" placeholder="Reply in this thread" aria-label="Thread reply"><button class="b" data-a="threadsend">Send reply</button></div></div>`;
+}
+async function loadThread(id) {
+  try { S.thread = (await api.messageReplies(id)).data; }
+  catch (e) { toast(e.message); return; }
+  draw();
+}
+// Delivery status card: driven ONLY by the real delivery row + arrived_at.
+// Step 1 reached at PREPARED or later; step 2 when arrived_at is set;
+// step 3 at DELIVERED. The QR shown is the order-reference QR only — it
+// authorizes nothing; the handover code remains the verification.
+async function renderStatusCard() {
+  const box = $('#statuscard'); if (!box || !S.conv) return;
+  const req = (S.requests || []).find((r) => {
+    const st = reqStatus(r);
+    return ['accepted', 'approved', 'confirmed'].includes(st) && (r.deliveryId || r.delivery_id);
+  });
+  if (!req) { box.innerHTML = ''; return; }
+  const deliveryId = req.deliveryId || req.delivery_id;
+  let d;
+  try { d = (await api.delivery(deliveryId)).data; }
+  catch { box.innerHTML = ''; return; }
+  const isMkt = d.fulfillment === 'marketplace';
+  const label = isMkt && d.status === 'DELIVERED' ? 'Item Exchanged' : (STATE_LABEL[d.status] || d.status);
+  const step = (reached, title, sub) => `<div><small>${reached ? '✓' : '○'} <b>${title}</b> — ${sub}</small></div>`;
+  const step1 = ['PREPARED', 'READY_FOR_PICKUP', 'DELIVERED'].includes(d.status);
+  const step2 = !!d.arrived_at;
+  const step3 = d.status === 'DELIVERED';
+  box.innerHTML = `<div class="c"><b>Delivery status: ${esc(label)}</b> <span class="tag">${esc(req.title)}</span><br>
+    ${step(step1, 'Seller En Route', step1 ? `Order is ${esc(label.toLowerCase())}` : 'Waiting for the seller to prepare the order')}
+    ${step(step2, 'Buyer Arriving', step2 ? 'Buyer has arrived at the drop-off point' : 'Buyer has not arrived yet')}
+    ${step(step3, 'QR Scan for Exchange', step3 ? 'Item exchanged' : 'Exchange happens with the handover code shown by the buyer')}
+    <div><img src="/api/deliveries/${esc(deliveryId)}/qr" alt="Order QR code (reference only)" class="qr-img"><br><small>The QR holds only the order reference — it never authorizes delivery on its own.</small></div>
+    <div class="row mt6"><button class="b g" data-a="od" data-id="${esc(deliveryId)}">View delivery</button></div>
+    ${isMkt && d.status === 'READY_FOR_PICKUP' ? '<div id="card-share"></div><div id="card-sharemap" class="map-box"></div>' : ''}</div>`;
+  if (isMkt && d.status === 'READY_FOR_PICKUP') {
+    const shareBox = $('#card-share');
+    mountGpsButton(shareBox, { label: 'pickup location share (30 minutes, one reading only)',
+      onReading: async (loc) => {
+        try { await api.sharePickupLocation(deliveryId, loc.lat, loc.lng); toast('Pickup location shared for 30 minutes'); await renderStatusCard(); }
+        catch (e) { toast(e.message); }
+      } });
+    try {
+      const sh = (await api.pickupLocation(deliveryId)).data.share;
+      if (sh && sh.sharerId !== me.id) {
+        const pins = [{ lat: sh.lat, lng: sh.lng, label: 'Other participant (shared pickup location)' }];
+        if (Number.isFinite(Number(d.dropoff_lat)) && Number.isFinite(Number(d.dropoff_lng))) {
+          pins.push({ lat: Number(d.dropoff_lat), lng: Number(d.dropoff_lng), label: 'Drop-off' });
+        }
+        mountPinsMap($('#card-sharemap'), pins);
+      } else { const m = $('#card-sharemap'); if (m) m.innerHTML = ''; }
+    } catch { /* no share to show */ }
+  }
+}
+function renderGroupExtras() {
+  const box = $('#gset'); if (!box || !S.conv) return;
+  const conv = S.conv;
+  if (conv.type !== 'group') { box.innerHTML = ''; return; }
+  const role = myRole(conv);
+  const isAdmin = ['owner', 'admin'].includes(role);
+  const isMod = ['owner', 'admin', 'moderator'].includes(role);
+  const rulesHtml = `<div class="c"><b>Group rules</b><br>${conv.rules ? `<small>${esc(conv.rules)}</small>` : '<small class="mu">No rules set yet.</small>'}
+    ${isAdmin ? `<div class="row mt6"><input id="gr-in" class="f" maxlength="1000" value="${esc(conv.rules || '')}" placeholder="Group rules" aria-label="Group rules"><button class="b g" data-a="rulessave">Save rules</button></div>` : ''}</div>`;
+  const membersHtml = `<div class="c"><b>Members</b>${(conv.members || []).map((m) => `<div class="row"><span class="f"><small>${esc(m.display_name || m.nexora_id)}</small> <span class="tag role">${ROLE_BADGE[m.role] || m.role}</span></span>
+    ${isAdmin && m.id !== me.id ? `<select id="role-${m.id}" class="wauto"><option value="member" ${m.role === 'member' ? 'selected' : ''}>Member</option><option value="moderator" ${m.role === 'moderator' ? 'selected' : ''}>Moderator</option>${role === 'owner' ? `<option value="admin" ${m.role === 'admin' ? 'selected' : ''}>Admin</option>` : ''}</select><button class="b g" data-a="roleset" data-id="${m.id}">Set role</button><button class="b r" data-a="memberrm" data-id="${m.id}">Remove</button>` : ''}
+    ${role === 'owner' && m.id !== me.id ? `<button class="b g" data-a="transfer" data-id="${m.id}">${S.confirmTransfer === m.id ? 'Tap again to confirm transfer' : 'Transfer ownership'}</button>` : ''}</div>`).join('')}</div>`;
+  const invitesHtml = !isAdmin ? '' : `<div class="c"><b>Invite links</b><br>
+    <label>Max uses (optional)<input id="inv-uses" type="number" min="1" placeholder="Unlimited"></label>
+    <button class="b g" data-a="invcreate">Create invite</button>
+    ${(S.invites || []).map((inv) => `<div class="row"><span class="f"><small><b>${esc(inv.code)}</b> · uses ${inv.uses}${inv.max_uses ? ` / ${inv.max_uses}` : ''}${inv.expires_at ? ` · expires ${T(inv.expires_at)}` : ''}</small></span><img src="${api.inviteQrUrl(conv.id, inv.code)}" alt="Invite QR (code only)" class="qr-img"></div>`).join('') || '<div class="mu"><small>No invites yet.</small></div>'}</div>`;
+  const joinHtml = !isAdmin ? '' : `<div class="c"><b>Join requests</b>${(S.joinReqs || []).filter((r) => r.status === 'REQUESTED').map((r) => `<div class="row"><span class="f"><small>${esc(r.requester_display_name || r.requester_nexora_id)}</small></span><button class="b" data-a="joinok" data-id="${r.id}">Approve</button><button class="b g" data-a="joinno" data-id="${r.id}">Decline</button></div>`).join('') || '<div class="mu"><small>No pending join requests.</small></div>'}</div>`;
+  const logHtml = !isAdmin ? '' : `<div class="c"><b>Admin log</b>${(S.glog || []).map((e) => `<div><small>${T(e.created_at)} · ${esc(e.actor_nexora_id || '—')} · ${esc(e.action)}</small></div>`).join('') || '<div class="mu"><small>No admin actions yet.</small></div>'}</div>`;
+  box.innerHTML = rulesHtml + membersHtml + invitesHtml + joinHtml + logHtml;
+  void isMod;
+}
+async function loadGroupExtras() {
+  if (!S.conv || S.conv.type !== 'group') return;
+  renderPins(); renderGroupExtras();
+  try { S.pins = (await api.pins(S.conv.id)).data; } catch { S.pins = []; }
+  const role = myRole(S.conv);
+  if (['owner', 'admin'].includes(role)) {
+    try { S.glog = (await api.adminLog(S.conv.id)).data; } catch { S.glog = []; }
+    try { S.invites = (await api.listInvites(S.conv.id)).data; } catch { S.invites = []; }
+    try { S.joinReqs = (await api.listJoinRequests(S.conv.id)).data; } catch { S.joinReqs = []; }
+  }
+  renderPins(); renderGroupExtras();
 }
 
 // ---------- delivery ----------
@@ -166,13 +388,13 @@ function dlv(v) {
   const m = (o || []).filter((x) => x.sender_id === me.id || x.courier_id === me.id);
   const l = S.dt === 'queue' ? q : m;
   v.innerHTML = `<h1><span></span>NEXORA TRANSIT</h1>${banner()}
-  <div class="c"><small>${health?.maps?.configured ? 'Routes: a distance/duration for an order is shown on its detail page when that order has coordinates.' : 'Tracking: <b>unavailable</b> — no map, geocoding or live-location provider is configured, so no positions or ETAs are shown.'} Status below comes only from recorded events. No payments are processed. There is no live tracking: a courier’s position is never followed.</small></div>
+  <div class="c"><small>${health?.maps?.configured ? 'Routes: a distance/duration for an order is shown on its detail page when that order has coordinates.' : 'Tracking: <b>unavailable</b> — no route provider is configured, so no distances are shown.'} Status below comes only from recorded events. No payments are processed in-app. There is no live tracking: a courier’s position is never followed. The detail page shows pickup and drop-off pins on a map when coordinates exist — no route line is drawn and no ETA is shown.</small></div>
   <div class="row"><button class="b ${S.dt === 'queue' ? '' : 'g'}" data-a="dt" data-k="queue">Queue (${q.length})</button><button class="b ${S.dt === 'mine' ? '' : 'g'}" data-a="dt" data-k="mine">My orders (${m.length})</button><span class="f"></span><button class="b" data-a="no">+ Order</button></div>
   <h2>${S.dt === 'queue' ? 'Open for couriers' : 'Sent / carrying'}</h2>` +
     (o === null ? '<div class="sk"></div>'
       : S.dt === 'queue' && !S.courier ? '<div class="c mu">The queue is for registered couriers. Register as a courier from your Profile to browse open orders.</div>'
       : !l.length ? '<div class="c mu">Nothing here yet.</div>'
-      : l.map((x) => `<button class="c" data-a="od" data-id="${esc(x.id)}"><b>${esc(x.name)}</b>${x.fragile ? '<span class="tag w">fragile</span>' : ''}<span class="tag">${STATE_LABEL[x.status] || x.status}</span>${x.disputed ? '<span class="tag w">DISPUTED</span>' : ''}<br><small>${esc(x.pickup_area)} → ${esc(x.dropoff_area)} · ${esc(x.size)} · offered ${esc(x.fee_offer || 0)} (not charged)</small></button>`).join(''));
+      : l.map((x) => `<button class="c" data-a="od" data-id="${esc(x.id)}"><b>${esc(x.name)}</b>${x.fragile ? '<span class="tag w">fragile</span>' : ''}<span class="tag">${stateTag(x)}</span>${x.disputed ? '<span class="tag w">DISPUTED</span>' : ''}<br><small>${esc(x.pickup_area)} → ${esc(x.dropoff_area)} · ${esc(x.size)} · offered ${esc(x.fee_offer || 0)} (not charged)</small></button>`).join(''));
 }
 
 function oform(v) {
@@ -182,15 +404,15 @@ function oform(v) {
   <label>Size<select id="f3"><option>Small (fits a bag)</option><option>Medium (box)</option><option>Large</option></select></label>
   <label>Weight (kg)<input id="f4" type="number" min="0" step="0.1"></label>
   <label>Pickup area (coarse)<input id="f5" maxlength="60"></label>
-  <div class="row"><button class="b g" data-a="gps" data-k="pickup">Use my location for pickup</button><span class="f"></span></div>
-  <div id="geo-pickup"></div>
-  <label>Pickup coordinates (optional, manual — latitude, longitude)<div class="row"><input id="f5a" type="number" step="any" min="-90" max="90" placeholder="Latitude, e.g. 23.81" aria-label="Pickup latitude"><input id="f5b" type="number" step="any" min="-180" max="180" placeholder="Longitude, e.g. 90.41" aria-label="Pickup longitude"></div></label>
-  <small>Manual coordinates are stored exactly as you typed them — they are not GPS-verified.</small>
+  <label>Pickup pin — click the map to place / move the pin<div id="map-pickup" class="map-box"></div></label>
+  <div id="coord-pickup" class="map-coord"></div><div id="gps-pickup"></div>
+  <label>Pickup coordinates (optional — picked, typed, or one-shot GPS)<div class="row"><input id="f5a" type="number" step="any" min="-90" max="90" placeholder="Latitude, e.g. 23.81" aria-label="Pickup latitude"><input id="f5b" type="number" step="any" min="-180" max="180" placeholder="Longitude, e.g. 90.41" aria-label="Pickup longitude"></div></label>
+  <small>Coordinates are stored exactly as picked or typed and labelled user-supplied, unless they came from the one-shot GPS reading — they are never GPS-verified otherwise.</small>
   <label>Drop-off area (coarse)<input id="f6" maxlength="60"></label>
-  <div class="row"><button class="b g" data-a="gps" data-k="dropoff">Use my location for drop-off</button><span class="f"></span></div>
-  <div id="geo-dropoff"></div>
-  <label>Drop-off coordinates (optional, manual — latitude, longitude)<div class="row"><input id="f6a" type="number" step="any" min="-90" max="90" placeholder="Latitude" aria-label="Drop-off latitude"><input id="f6b" type="number" step="any" min="-180" max="180" placeholder="Longitude" aria-label="Drop-off longitude"></div></label>
-  <small>Manual coordinates are stored exactly as you typed them — they are not GPS-verified.</small>
+  <label>Drop-off pin — click the map to place / move the pin<div id="map-dropoff" class="map-box"></div></label>
+  <div id="coord-dropoff" class="map-coord"></div><div id="gps-dropoff"></div>
+  <label>Drop-off coordinates (optional — picked, typed, or one-shot GPS)<div class="row"><input id="f6a" type="number" step="any" min="-90" max="90" placeholder="Latitude" aria-label="Drop-off latitude"><input id="f6b" type="number" step="any" min="-180" max="180" placeholder="Longitude" aria-label="Drop-off longitude"></div></label>
+  <small>Coordinates are stored exactly as picked or typed and labelled user-supplied, unless they came from the one-shot GPS reading — they are never GPS-verified otherwise.</small>
   <label>Instructions (shown only to participants)<textarea id="f7" maxlength="300"></textarea></label>
   <label>Offered fee (informational, not charged)<input id="f8" type="number" min="0"></label>
   <label><input id="f9" type="checkbox" class="wauto"> Fragile / special handling</label>
@@ -206,16 +428,48 @@ function oform(v) {
     S.photoPreview = URL.createObjectURL(f);
     $('#pv').innerHTML = `<small>Preview:</small><br><img src="${S.photoPreview}" class="preview-img" alt="Parcel preview">`;
   });
+  // Map pin pickers, kept in sync with the typed coordinate inputs and the
+  // one-shot GPS buttons. Typed/picked = user-supplied; GPS = one-shot reading.
+  const coordLabel = (loc) => loc
+    ? `${fmt(loc.lat, loc.lng)} · ${loc.source === 'gps' ? 'one-shot GPS reading' : 'user-supplied (picked / typed, not GPS-verified)'}`
+    : 'No pin placed yet — optional.';
+  const wirePicker = (kind, mapEl, coordEl, latEl, lngEl, gpsEl) => {
+    const setLoc = (loc) => {
+      if (kind === 'pickup') S.pickupLoc = loc; else S.dropoffLoc = loc;
+      $(latEl).value = loc ? loc.lat : ''; $(lngEl).value = loc ? loc.lng : '';
+      $(coordEl).textContent = coordLabel(loc);
+    };
+    const picker = mountPinPicker($(mapEl), { onPick: setLoc });
+    $(coordEl).textContent = coordLabel(null);
+    mountGpsButton($(gpsEl), { label: kind, onReading: (loc) => { picker?.set(loc.lat, loc.lng, 'gps'); setLoc(loc); } });
+    const syncFromInputs = () => {
+      const lat = Number($(latEl).value), lng = Number($(lngEl).value);
+      if ($(latEl).value !== '' && $(lngEl).value !== '' && Number.isFinite(lat) && Number.isFinite(lng)) {
+        picker?.setFromInputs(lat, lng); setLoc({ lat, lng, source: 'manual' });
+      } else if ($(latEl).value === '' && $(lngEl).value === '') {
+        if (kind === 'pickup') S.pickupLoc = null; else S.dropoffLoc = null;
+        $(coordEl).textContent = coordLabel(null);
+      }
+    };
+    $(latEl).addEventListener('change', syncFromInputs);
+    $(lngEl).addEventListener('change', syncFromInputs);
+    return picker;
+  };
+  wirePicker('pickup', '#map-pickup', '#coord-pickup', '#f5a', '#f5b', '#gps-pickup');
+  wirePicker('dropoff', '#map-dropoff', '#coord-dropoff', '#f6a', '#f6b', '#gps-dropoff');
 }
 
 function odetail(v) {
   const o = S.order; if (!o) { S.oid = null; return render(); }
   const mine = o.sender_id === me.id, cr = o.courier_id === me.id, part = mine || cr || me.role === 'admin';
+  const isMkt = o.fulfillment === 'marketplace';
+  const mktCancellable = isMkt ? ['CREATED', 'PREPARED', 'READY_FOR_PICKUP'].includes(o.status) : CANCELLABLE.includes(o.status);
+  const mktDropoffEditable = isMkt && ['PREPARED', 'READY_FOR_PICKUP'].includes(o.status);
   const hist = S.history || [];
   const byStatus = {}; hist.forEach((h) => { byStatus[h.to_status] = h.created_at; });
   const tl = STATES.map((n, i) => {
     const e = byStatus[n];
-    return `<li class="${e ? 'on' : n === o.status ? 'nx' : ''}"><i></i><b>${STATE_LABEL[n]}</b><small>${e ? T(e) : ''}</small></li>`;
+    return `<li class="${e ? 'on' : n === o.status ? 'nx' : ''}"><i></i><b>${(n === 'DELIVERED' && o.fulfillment === 'marketplace') ? 'Item Exchanged' : STATE_LABEL[n]}</b><small>${e ? T(e) : ''}</small></li>`;
   }).join('');
   let ac = '';
   if (o.status === 'SEARCHING_FOR_COURIER' && !mine && S.courier) ac = '<button class="b" data-a="acc">Accept this order</button>';
@@ -226,19 +480,155 @@ function odetail(v) {
   else if (cr && o.status === 'DROPOFF_VERIFIED') ac = '<button class="b" data-a="step" data-k="DELIVERED">Mark delivered</button>';
   v.innerHTML = `<div class="row"><button class="b g" data-a="ob">←</button><b class="f">${esc(o.name)}</b></div>${banner()}
   <div class="c"><small>${esc(o.category)} · ${esc(o.size)} · ${esc(o.weight_kg ?? '?')} kg${o.fragile ? ' · fragile' : ''}<br>${esc(o.pickup_area)} → ${esc(o.dropoff_area)}<br>Ref: ${esc(o.public_ref)}<br>Fee offered: ${esc(o.fee_offer || 0)} (no payment integrated)${part && o.instructions ? `<br>Notes: ${esc(o.instructions)}` : ''}</small></div>
-  <div class="c"><b>Status${o.disputed ? ' · DISPUTED' : ''}</b>${o.status === 'CANCELLED' ? '<div class="tag w">CANCELLED</div>' : ''}<ol>${tl}</ol><small>Live location: unavailable — no courier position is ever tracked.</small></div>
+  <div class="c"><b>Status: ${o.fulfillment === 'marketplace' && o.status === 'DELIVERED' ? 'Item Exchanged' : (STATE_LABEL[o.status] || o.status)}${o.disputed ? ' · DISPUTED' : ''}</b>${o.status === 'CANCELLED' ? '<div class="tag w">CANCELLED</div>' : ''}<ol>${tl}</ol><small>Live location: unavailable — no courier position is ever tracked.</small></div>
   ${S.route ? `<div class="c"><b>Route (road distance, from the map provider)</b><br>${(S.route.distanceKm).toFixed(2)} km · about ${Math.round(S.route.durationMinutes)} min<br><small>${esc(S.route.from.source === 'user-supplied' ? 'Endpoints you supplied, not GPS-verified. ' : '')}${esc(S.route.attribution || '')}</small></div>`
     : `<div class="c"><small>Route: ${esc(S.routeNote || 'no route is shown for this order.')}</small></div>`}
   ${o.photo_file_id ? `<div class="c"><small>Parcel photo is stored privately and visible only to participants.</small></div>` : ''}
+  <div class="c"><b>Pickup &amp; drop-off pins</b><div id="omap" class="map-box"></div><div id="omap-note" class="map-coord"></div>
+  <small>Pins are shown exactly as stored: user-supplied unless they came from a one-shot GPS reading. No route line is drawn — the route API returns no geometry — and no ETA is shown.</small></div>
+  <div id="mkt"></div>
+  <div id="dphoto"></div>
+  <div id="shareloc"></div>
+  <div id="otherrep"></div>
+  <div id="rateform"></div>
   ${ac}
   ${mine && S.codes ? `<div class="c" id="cc"><small>Handover codes — share these with the courier / recipient. They expire and can only be used once.</small><br>
     Pickup (give to courier): <b>${S.codes.pickup?.code || '(used / expired)'}</b><br>
     Delivery (give to recipient): <b>${S.codes.dropoff?.code || '(used / expired)'}</b><br>
     <small>Valid until ${S.codes.pickup ? T(S.codes.pickup.expiresAt) : '—'}</small></div>` : ''}
   ${mine ? `<div class="c"><b>Order QR</b><br><img src="/api/deliveries/${esc(o.id)}/qr" alt="Order QR code" class="qr-img"><br><small>The QR holds only the order reference — it never authorizes delivery on its own.</small></div>` : ''}
-  ${part && CANCELLABLE.includes(o.status) && mine ? `<div class="row"><button class="b r" data-a="cx">Cancel order</button></div>` : ''}
+  ${part && mktCancellable && mine ? `<div class="row"><button class="b r" data-a="cx">Cancel order</button></div>` : ''}
   ${part && !o.disputed && !['DELIVERED', 'CANCELLED'].includes(o.status) ? `<h2>Report a problem</h2><input id="dr" maxlength="200" placeholder="What went wrong?" aria-label="Dispute reason"><button class="b r" data-a="dsp">Open dispute</button>` : ''}
   ${o.disputed ? `<div class="c"><small>Disputed: ${esc(o.dispute_reason || '')} — an admin reviews disputes.</small></div>` : ''}`;
+  // Post-render: pins map + marketplace actions. Field names are read
+  // defensively (snake_case from the existing API, camelCase from the
+  // marketplace contract) because the new backend fields are not yet live.
+  const plat = o.pickup_lat ?? o.pickupLat, plng = o.pickup_lng ?? o.pickupLng;
+  const dlat = o.dropoff_lat ?? o.dropoffLat, dlng = o.dropoff_lng ?? o.dropoffLng;
+  const hasPickup = Number.isFinite(Number(plat)) && Number.isFinite(Number(plng));
+  const hasDropoff = Number.isFinite(Number(dlat)) && Number.isFinite(Number(dlng));
+  if (hasPickup || hasDropoff) {
+    mountPinsMap($('#omap'), [
+      ...(hasPickup ? [{ lat: Number(plat), lng: Number(plng), label: 'Pickup' }] : []),
+      ...(hasDropoff ? [{ lat: Number(dlat), lng: Number(dlng), label: 'Drop-off' }] : []),
+    ]);
+    const dsrc = o.dropoff_coord_source || o.dropoffCoordSource;
+    $('#omap-note').textContent = `Pickup: ${hasPickup ? fmt(plat, plng) : 'not stored'} · Drop-off: ${hasDropoff ? `${fmt(dlat, dlng)} (${dsrc === 'gps' ? 'one-shot GPS reading' : 'user-supplied'})` : 'not stored'}`;
+  } else {
+    $('#omap').innerHTML = '<div class="c mu"><small>No coordinates stored for this delivery, so no pins are shown.</small></div>';
+  }
+  const sellerId = o.seller_id || o.sellerId || o.sender_id;
+  const buyerId = o.buyer_id || o.buyerId || o.recipient_id || o.recipientId || o.receiver_id;
+  const isSeller = sellerId === me.id, isBuyer = buyerId ? buyerId === me.id : false;
+  const terminal = ['DELIVERED', 'CANCELLED'].includes(o.status);
+  const dir = (hasPickup && hasDropoff) ? directionsUrl({ lat: plat, lng: plng }, { lat: dlat, lng: dlng }) : null;
+  const pay = o.payment || o.payment_record || o.paymentRecord || o.cash_payment || o.cashPayment || null;
+  const payPayerId = pay ? (pay.payer_id ?? pay.payerId) : null;
+  const payPayeeId = pay ? (pay.payee_id ?? pay.payeeId) : null;
+  const payWhen = pay ? (pay.recorded_at ?? pay.recordedAt ?? pay.paidAt ?? pay.paid_at ?? pay.timestamp ?? pay.createdAt) : null;
+  const payHtml = o.status === 'DELIVERED'
+    ? (pay ? `<div class="c"><b>Cash payment record</b><br><small>Amount: ${esc(pay.amountMinor ?? pay.amount ?? pay.amount_minor ?? '—')} (minor units, as recorded)<br>Payer: ${esc(payPayerId ? (payPayerId === me.id ? 'You (buyer)' : 'Buyer') : '—')} · Payee: ${esc(payPayeeId ? (payPayeeId === me.id ? 'You (seller)' : 'Seller') : '—')}<br>Recorded: ${payWhen ? T(payWhen) : '—'}</small><br><small>This is a payment RECORD only — no money moves in-app.</small></div>`
+      : '<div class="c mu"><small>No cash payment record was returned for this delivery.</small></div>')
+    : '';
+  let mkt = '';
+  // 005 guidance copy, shown on every marketplace drop-off/pickup view
+  // (not only the pre-pickup editor/buyer blocks, which hide at DELIVERED).
+  if (isMkt) {
+    mkt += '<div class="c"><small>Meet in a well-lit public place. Check the photo and pin before you travel, and confirm the handover code in person.</small></div>';
+  }
+  if (isSeller && isMkt && !terminal && (o.status === 'CREATED' || o.status === 'READY_FOR_PICKUP')) {
+    mkt += `<div class="c"><b>Seller actions</b><br>
+      ${o.status === 'CREATED' ? '<button class="b" data-a="prep">Mark prepared</button>' : ''}
+      ${o.status === 'READY_FOR_PICKUP' ? `<label>Confirm handover — code from the buyer<input id="ho-code" inputmode="numeric" maxlength="6" placeholder="6-digit code" aria-label="Handover code"></label>
+      <button class="b" data-a="handover">Confirm handover</button>` : ''}</div>`;
+  }
+  if (isSeller && mktDropoffEditable) {
+    mkt += `<div class="c"><b>Set / edit drop-off</b><br><small>Seller only, before pickup. Click the map to move the pin.</small>
+      <div id="edit-dropoff-map" class="map-box"></div><div id="edit-dropoff-coord" class="map-coord"></div><div id="edit-dropoff-gps"></div>
+      <label>Drop-off area<input id="ed-area" maxlength="60" value="${esc(o.dropoff_area || '')}"></label>
+      <label>Drop-off photo (optional)<input id="ed-photo" type="file" accept="image/*" capture="environment"></label>
+      <button class="b" data-a="dropoffsave">Save drop-off</button><br>
+      <small>Meet in a well-lit public place. Check the photo and pin before you travel, and confirm the handover code in person.</small></div>`;
+  }
+  if (isBuyer && isMkt && !terminal) {
+    mkt += `<div class="c"><b>Buyer actions</b><br>
+      ${dir ? `<a href="${esc(dir)}" target="_blank" rel="noopener">Open directions (OpenStreetMap, pickup → drop-off)</a><br>` : '<small>Directions need both pickup and drop-off coordinates.</small><br>'}
+      ${o.status === 'READY_FOR_PICKUP' ? '<button class="b" data-a="arrive">Confirm arrival</button>' : '<small>Arrival confirmation opens once the seller sets the drop-off point.</small>'}<br>
+      <small>Meet in a well-lit public place. Check the photo and pin before you travel, and confirm the handover code in person.</small></div>`;
+  }
+  if (!isSeller && !isBuyer && buyerId) mkt += '';
+  $('#mkt').innerHTML = mkt + payHtml;
+  if (isSeller && mktDropoffEditable) {
+    const storedSrc = o.dropoff_coord_source || o.dropoffCoordSource || 'user-supplied';
+    S.dropoffPick = hasDropoff ? { lat: Number(dlat), lng: Number(dlng), source: storedSrc } : null;
+    S.dropoffPhotoFile = null;
+    const ep = mountPinPicker($('#edit-dropoff-map'), {
+      initial: S.dropoffPick,
+      onPick: (loc) => { S.dropoffPick = loc; const c = $('#edit-dropoff-coord'); if (c) c.textContent = `${fmt(loc.lat, loc.lng)} · ${loc.source === 'gps' ? 'one-shot GPS reading' : 'user-supplied (picked, not GPS-verified)'}`; },
+    });
+    const c0 = $('#edit-dropoff-coord');
+    if (c0) c0.textContent = S.dropoffPick ? `${fmt(S.dropoffPick.lat, S.dropoffPick.lng)} · stored drop-off pin (${storedSrc === 'gps' ? 'one-shot GPS reading' : 'user-supplied'})` : 'No drop-off pin yet — click the map to place one.';
+    $('#ed-photo')?.addEventListener('change', (e) => { S.dropoffPhotoFile = e.target.files[0] || null; });
+    S.dropoffPicker = ep;
+    mountGpsButton($('#edit-dropoff-gps'), { label: 'drop-off', onReading: (loc) => { S.dropoffPicker?.set(loc.lat, loc.lng, 'gps'); } });
+  }
+  // Drop-off photo for the buyer (and other participants): prefer the signed
+  // URL the API returns; otherwise mint one from the stored file id.
+  (async () => {
+    const box = $('#dphoto'); if (!box) return;
+    const url = o.dropoff_photo_url || o.dropoffPhotoUrl || o.dropoff_photo_download_url;
+    const fid = o.dropoff_photo_file_id || o.dropoffPhotoFileId;
+    let show = url || null;
+    if (!show && fid) { try { show = (await api.fileUrl(fid)).data.downloadUrl; } catch { show = null; } }
+    if (show) box.innerHTML = `<div class="c"><b>Drop-off photo</b><br><img src="${esc(show)}" class="preview-img" alt="Drop-off place photo"><br><small>Photo of the drop-off place, as supplied by the seller.</small></div>`;
+    else if (isBuyer) box.innerHTML = '<div class="c mu"><small>No drop-off photo has been supplied yet.</small></div>';
+  })();
+  // 005: pickup-location share (READY_FOR_PICKUP only), other party's
+  // reputation, and the post-delivery rating form — marketplace only.
+  (async () => {
+    const otherId = isSeller ? buyerId : (isBuyer ? sellerId : null);
+    if (!isMkt || !otherId) return;
+    const repBox = $('#otherrep');
+    if (repBox && ['READY_FOR_PICKUP', 'DELIVERED'].includes(o.status)) {
+      try {
+        const rep = (await api.userReputation(otherId)).data;
+        repBox.innerHTML = `<div class="c"><b>Other party's reputation</b><br><small>${rep.avgStars === null
+          ? 'No ratings yet'
+          : `★ ${Number(rep.avgStars).toFixed(1)} · ${rep.ratingsCount} rating${rep.ratingsCount === 1 ? '' : 's'} · ${rep.completedDeliveries} completed deliver${rep.completedDeliveries === 1 ? 'y' : 'ies'}`}</small><br><small>Computed only from real completed deliveries and ratings — never estimated.</small></div>`;
+      } catch { /* reputation unavailable */ }
+    }
+    if (o.status === 'DELIVERED' && (isSeller || isBuyer)) {
+      const rf = $('#rateform');
+      if (rf) rf.innerHTML = `<div class="c"><b>Rate the other party</b><br>
+        <label>Stars<select id="rt-stars"><option value="5">5 ★</option><option value="4">4 ★</option><option value="3">3 ★</option><option value="2">2 ★</option><option value="1">1 ★</option></select></label>
+        <label>Comment (optional)<input id="rt-comment" maxlength="500" placeholder="How did the handoff go?"></label>
+        <button class="b" data-a="ratesubmit">Submit rating</button><br><small>One rating per delivery. Only delivered orders can be rated.</small></div>`;
+    }
+    if (o.status === 'READY_FOR_PICKUP' && (isSeller || isBuyer)) {
+      const sl = $('#shareloc');
+      if (!sl) return;
+      sl.innerHTML = `<div class="c"><b>Live pickup location (30 minutes)</b><br>
+        <small>Share one reading of your current position with the other participant, only while the order is ready for pickup. It expires after 30 minutes and is never tracked afterwards.</small>
+        <div id="share-gps"></div><div id="share-map" class="map-box"></div><div id="share-note" class="map-coord"></div></div>`;
+      mountGpsButton($('#share-gps'), { label: 'pickup location share (30 minutes, one reading only)',
+        onReading: async (loc) => {
+          try { await api.sharePickupLocation(o.id, loc.lat, loc.lng); toast('Pickup location shared for 30 minutes'); await openOrder(o.id); }
+          catch (e) { toast(e.message); }
+        } });
+      try {
+        const sh = (await api.pickupLocation(o.id)).data.share;
+        if (sh) {
+          const mine = sh.sharerId === me.id;
+          $('#share-note').textContent = mine
+            ? `You shared ${fmt(sh.lat, sh.lng)} — expires ${T(sh.expiresAt)}.`
+            : `Other participant shared ${fmt(sh.lat, sh.lng)} — expires ${T(sh.expiresAt)}.`;
+          mountPinsMap($('#share-map'), [{ lat: sh.lat, lng: sh.lng, label: mine ? 'Your shared location' : 'Other participant' }]);
+        } else {
+          $('#share-note').textContent = 'No live pickup location is being shared right now.';
+        }
+      } catch { /* no share */ }
+    }
+  })();
 }
 
 function act2(v) {
@@ -251,7 +641,7 @@ function act2(v) {
       : convs.map((c) => `<button class="c" data-a="open" data-id="${esc(c.id)}"><span class="dot"></span><b>${esc(c.name || 'Direct message')}</b> · ${c.unread} new</button>`).join('')) +
     `<h2>My deliveries</h2>` +
     (!mine.length ? '<div class="c mu">No deliveries yet.</div>'
-      : mine.map((x) => `<button class="c" data-a="od" data-id="${esc(x.id)}"><b>${esc(x.name)}</b> → ${STATE_LABEL[x.status] || x.status}<br><small>${T(x.updated_at)}</small></button>`).join(''));
+      : mine.map((x) => `<button class="c" data-a="od" data-id="${esc(x.id)}"><b>${esc(x.name)}</b> → ${stateTag(x)}<br><small>${T(x.updated_at)}</small></button>`).join(''));
 }
 
 function prof(v) {
@@ -264,7 +654,7 @@ function prof(v) {
   <div class="c"><b>Session</b><br><small>Signed in with a server session (HttpOnly cookie). Your NEXORA ID is pseudonymous, not absolutely anonymous: the server can link activity to your account for moderation. Messages are <b>not</b> end-to-end encrypted.</small><br><br><button class="b g" data-a="logout">Sign out</button> <button class="b r" data-a="reset">${S.confirmDelete ? 'Tap again to confirm deletion' : 'Delete account'}</button></div>
   <div class="c"><b>Theme</b><div class="row">${['auto', 'dark', 'light'].map((k) => `<button class="b ${th === k ? '' : 'g'}" data-a="th" data-k="${k}">${k}</button>`).join('')}</div></div>
   <div class="c"><b>Blocked (${blk.length})</b>${blk.map((b) => `<div class="row"><span class="f">${esc(b.nexora_id)}</span><button class="b g" data-a="unb" data-h="${esc(b.nexora_id)}">Unblock</button></div>`).join('') || '<br><small>No one blocked.</small>'}</div>
-  <div class="c"><small><b>Not included in this build:</b> live GPS tracking, push notifications, E2EE, payments. Map routing is shown only when a provider is configured, and only as distance/duration — no map is rendered and no position is tracked.</small></div>`;
+  <div class="c"><small><b>Not included in this build:</b> live GPS tracking, push notifications, E2EE, in-app payments. Maps show stored pickup/drop-off pins only — no route line is drawn, no ETA is shown, and no position is tracked. Map routing distance/duration is shown only when a provider is configured.</small></div>`;
   applyDynamicStyles();
 }
 
@@ -293,6 +683,8 @@ async function openConv(id) {
       if (!isMember) await api.joinRoom(id);
     }
     S.conv = conv; S.msgs = null; S.reply = null; S.sel = null; S.msgPage = 1;
+    S.requests = null; S.reqShowForm = false; S.reqEdit = null;
+    S.pins = null; S.thread = null; S.glog = null; S.invites = null; S.joinReqs = null; S.confirmTransfer = null;
     S.pendingAttachment = null; S.pendingAttachmentName = null;
     render();
     const page = await api.messages(id, 1);
@@ -302,6 +694,7 @@ async function openConv(id) {
     // join (a failed markRead previously left the message list empty forever).
     try { await api.markRead(id); } catch { /* unread count refreshes next load */ }
     draw();
+    loadRequests();
     socket?.emit('conversation:join', id);
     await refreshUnread();
   } catch (e) { toast(e.message); }
@@ -355,7 +748,11 @@ const act = {
       draw();
     } catch (e) { i.value = t; toast('Not sent: ' + e.message); }
   },
-  sel(d, el) { if (el.target.closest('button,a,input')) return; S.sel = S.sel === d.id ? null : d.id; S.editing = null; draw(); },
+  // The click listener passes the [data-a] element as `el`, not the event,
+  // so the event target comes from the listener's global e0 (set before
+  // dispatch). Reading el.target here used to throw, which silently broke
+  // message selection — and with it the reply/edit/react panels.
+  sel(d, el) { if (e0.target.closest('button,a,input')) return; S.sel = S.sel === d.id ? null : d.id; S.editing = null; draw(); },
   reply(d) { S.reply = S.msgs.find((m) => m.id === d.id); S.sel = null; draw(); $('#in').focus(); },
   xr() { S.reply = null; draw(); },
   edit(d) { S.editing = d.id; draw(); const ed = $('#ed'); ed?.focus(); },
@@ -374,6 +771,64 @@ const act = {
   async addm() {
     const v = $('#am').value.trim(); if (!v) return;
     try { await api.addMember(S.conv.id, v); toast('Added ' + v); await openConv(S.conv.id); } catch (e) { toast(e.message); }
+  },
+  // --- 005: reactions / threads / pins / group admin ---
+  async react(d) {
+    try {
+      await api.toggleReaction(d.id, d.e);
+      const page = await api.messages(S.conv.id, 1);
+      S.msgs = page.data.slice().reverse(); draw();
+    } catch (e) { toast(e.message); }
+  },
+  async thread(d) { await loadThread(d.id); },
+  threadx() { S.thread = null; draw(); },
+  async threadsend() {
+    const v = $('#th-in').value.trim(); if (!v || !S.thread) return;
+    try {
+      await api.sendMessage(S.conv.id, { body: v, replyToId: S.thread.parent.id });
+      $('#th-in').value = '';
+      await loadThread(S.thread.parent.id);
+      const page = await api.messages(S.conv.id, 1);
+      S.msgs = page.data.slice().reverse(); S.msgPage = 1; S.msgPages = page.meta.pages; draw();
+    } catch (e) { toast(e.message); }
+  },
+  async pin(d) { try { await api.pinMessage(S.conv.id, d.id); toast('Pinned'); await loadGroupExtras(); } catch (e) { toast(e.message); } },
+  async unpin(d) { try { await api.unpinMessage(S.conv.id, d.id); toast('Unpinned'); await loadGroupExtras(); } catch (e) { toast(e.message); } },
+  async rulessave() {
+    try { await api.updateGroupRules(S.conv.id, $('#gr-in').value.trim()); toast('Rules saved'); await openConv(S.conv.id); } catch (e) { toast(e.message); }
+  },
+  async roleset(d) {
+    const sel = document.getElementById(`role-${d.id}`);
+    if (!sel) return;
+    try { await api.setMemberRole(S.conv.id, d.id, sel.value); toast('Role updated'); await openConv(S.conv.id); } catch (e) { toast(e.message); }
+  },
+  async memberrm(d) { try { await api.removeMember(S.conv.id, d.id); toast('Member removed'); await openConv(S.conv.id); } catch (e) { toast(e.message); } },
+  async transfer(d) {
+    if (S.confirmTransfer !== d.id) {
+      S.confirmTransfer = d.id; renderGroupExtras();
+      setTimeout(() => { if (S.confirmTransfer === d.id) { S.confirmTransfer = null; renderGroupExtras(); } }, 4000);
+      return;
+    }
+    try { await api.transferOwnership(S.conv.id, d.id); toast('Ownership transferred'); await openConv(S.conv.id); } catch (e) { toast(e.message); }
+  },
+  async invcreate() {
+    const raw = $('#inv-uses').value.trim();
+    try { await api.createInvite(S.conv.id, raw === '' ? {} : { maxUses: Math.max(1, Math.round(Number(raw))) }); toast('Invite created'); await loadGroupExtras(); } catch (e) { toast(e.message); }
+  },
+  async joinok(d) { try { await api.decideJoinRequest(S.conv.id, d.id, 'approve'); toast('Join approved'); await loadGroupExtras(); } catch (e) { toast(e.message); } },
+  async joinno(d) { try { await api.decideJoinRequest(S.conv.id, d.id, 'decline'); toast('Join declined'); await loadGroupExtras(); } catch (e) { toast(e.message); } },
+  async joincode() {
+    const code = $('#jc-code').value.trim(); if (!code) return;
+    try { const r = await api.joinByCode(code); toast('Joined group'); await loadChats(); await openConv(r.data.conversationId); } catch (e) { toast(e.message); }
+  },
+  async groupjoinreq() {
+    const id = $('#jr-id').value.trim(); if (!id) return;
+    try { await api.createJoinRequest(id); toast('Join request sent — an owner/admin must approve it'); } catch (e) { toast(e.message); }
+  },
+  async ratesubmit() {
+    const stars = Number($('#rt-stars').value);
+    const comment = $('#rt-comment').value.trim() || undefined;
+    try { await api.rateDelivery(S.oid, stars, comment); toast('Rating submitted'); await openOrder(S.oid); } catch (e) { toast(e.message); }
   },
   dt(d) { S.dt = d.k; render(); },
   no() { S.form = 'o'; S.photoFile = null; render(); },
@@ -474,6 +929,70 @@ const act = {
       for (const c of (S.convs || []).filter((c) => c.unread)) await api.markRead(c.id);
       await loadChats(); render();
     } catch (e) { toast(e.message); }
+  },
+  // --- delivery requests + settings ---
+  reqform() { S.reqShowForm = !S.reqShowForm; S.reqEdit = null; renderRequests(); },
+  async reqcreate() {
+    const title = $('#rq-title').value.trim(), desc = $('#rq-desc').value.trim();
+    if (!title) return toast('Title is required');
+    const priceRaw = $('#rq-price').value.trim();
+    const body = { conversationId: S.conv.id, title, description: desc || undefined,
+      priceMinor: priceRaw === '' ? undefined : Math.max(0, Math.round(Number(priceRaw))),
+      note: $('#rq-note').value.trim() || undefined };
+    if (S.conv.type === 'group') body.targetId = $('#rq-target').value;
+    else if (S.conv.type === 'dm') {
+      const other = (S.conv.members || []).find((m) => m.id !== me?.id);
+      if (other) body.targetId = other.id;
+    }
+    if (body.priceMinor !== undefined && !Number.isFinite(body.priceMinor)) return toast('Price must be a number (minor units)');
+    try { await api.createDeliveryRequest(body); S.reqShowForm = false; toast('Request sent'); await loadRequests(); }
+    catch (e) { toast(e.message); }
+  },
+  async reqaccept(d) { try { await api.acceptDeliveryRequest(d.id); toast('Request accepted'); await loadRequests(); } catch (e) { toast(e.message); } },
+  async reqdecline(d) { try { await api.declineDeliveryRequest(d.id); toast('Request declined'); await loadRequests(); } catch (e) { toast(e.message); } },
+  async reqcancel(d) { try { await api.cancelDeliveryRequest(d.id); toast('Request cancelled'); await loadRequests(); } catch (e) { toast(e.message); } },
+  reqedit(d) { S.reqEdit = S.reqEdit === d.id ? null : d.id; renderRequests(); },
+  async reqsave(d) {
+    const priceRaw = $('#rq-eprice').value.trim();
+    const patch = { note: $('#rq-enote').value.trim() || undefined,
+      priceMinor: priceRaw === '' ? undefined : Math.max(0, Math.round(Number(priceRaw))) };
+    try { await api.updateDeliveryRequest(d.id, patch); S.reqEdit = null; toast('Request updated'); await loadRequests(); }
+    catch (e) { toast(e.message); }
+  },
+  async dsetsave() {
+    try {
+      await api.updateDeliverySettings(S.conv.id, { enabled: $('#ds-en').checked });
+      toast('Delivery settings saved'); await openConv(S.conv.id);
+    } catch (e) { toast(e.message); }
+  },
+  // --- marketplace delivery actions ---
+  async prep() { try { await api.prepareDelivery(S.oid); toast('Marked prepared'); await openOrder(S.oid); } catch (e) { toast(e.message); } },
+  async dropoffsave() {
+    if (!S.dropoffPick) return toast('Place a drop-off pin on the map first');
+    if (S.busy) return; S.busy = true;
+    try {
+      let photoFileId;
+      if (S.dropoffPhotoFile) {
+        // Existing private-file endpoint; it also stores the id on the
+        // delivery, and the id is passed to the dropoff PATCH per contract.
+        const up = await api.uploadParcelPhoto(S.oid, S.dropoffPhotoFile);
+        photoFileId = up.data.id;
+      }
+      await api.updateDropoff(S.oid, {
+        dropoffLat: S.dropoffPick.lat, dropoffLng: S.dropoffPick.lng,
+        dropoffArea: $('#ed-area').value.trim() || undefined,
+        dropoffPhotoFileId: photoFileId,
+        dropoffCoordSource: S.dropoffPick.source || 'user-supplied',
+      });
+      toast('Drop-off saved'); await openOrder(S.oid);
+    } catch (e) { toast(e.message); }
+    S.busy = false;
+  },
+  async arrive() { try { await api.arriveDelivery(S.oid); toast('Arrival confirmed'); await openOrder(S.oid); } catch (e) { toast(e.message); } },
+  async handover() {
+    const code = ($('#ho-code').value || '').trim();
+    if (!/^\d{6}$/.test(code)) return toast('Enter the 6-digit code');
+    try { await api.handoverDelivery(S.oid, code); toast('Handover confirmed'); await openOrder(S.oid); } catch (e) { toast(e.message); }
   },
   th(d) { th = d.k; localStorage.setItem('nx_th', th); setTh(); render(); },
   gl(d) { if (!me) return; me.avatarGlyph = d.g; render(); },

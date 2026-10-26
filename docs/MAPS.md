@@ -29,16 +29,20 @@ no-key model:
 - **Self-hosted OSRM / Nominatim** is the production path for the OSM
   stack: same API, different base URL, no demo-server limits. Point
   `MAPS_ROUTE_BASE_URL` / `MAPS_GEOCODE_BASE_URL` at your own instance.
-- **Tiles / rendered maps are deliberately out of scope.** NEXORA renders
-  no map: the route response carries distance/duration only, and its
-  `geometry` field is honestly `null` (the OSRM call uses
-  `overview=false`) rather than a fabricated polyline.
+- **Rendered maps (since 2026-10-26).** The frontend renders a real map:
+  Leaflet 1.9.4 vendored locally under `frontend/vendor/leaflet/` (no CDN,
+  no key) with OpenStreetMap tiles and the required attribution, a
+  click-to-place/draggable pin picker for pickup and drop-off, and a pins
+  map on the delivery detail page. The route response itself still carries
+  distance/duration only, and its `geometry` field is honestly `null` (the
+  OSRM call uses `overview=false`) — no route polyline is ever drawn, so
+  no route line is fabricated.
 
 ## Environment variables
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MAPS_PROVIDER` | (empty = none) | `osrm` enables the OSM stack. Anything else → the route endpoint returns 503 `MAPS_NOT_IMPLEMENTED`. Empty → 503 `MAPS_NOT_CONFIGURED`. |
+| `MAPS_PROVIDER` | (empty = none) | `osrm` enables the OSM stack. Anything else → the route endpoint returns 503 `MAPS_NOT_IMPLEMENTED`. Empty → 503 `MAPS_NOT_CONFIGURED`. `render.yaml` sets `osrm` for the live Render deployment (2026-10-26); if a Blueprint sync does not apply it to the existing service, set it in the Render dashboard. The local default remains empty. |
 | `MAPS_ROUTE_BASE_URL` | `https://router.project-osrm.org` | OSRM base URL (self-host override). |
 | `MAPS_GEOCODE_BASE_URL` | `https://nominatim.openstreetmap.org` | Nominatim base URL (self-host override). |
 | `MAPS_TIMEOUT_MS` | `5000` | Per-request timeout (clamped to 100–30000 ms) via `AbortSignal.timeout()`. |
@@ -118,6 +122,11 @@ material ever reaches the client):
   user-supplied / not GPS-verified; if both manual and GPS values exist,
   manual wins. A GPS reading is cleared after the order is created so a
   later form never silently reuses it.
+- **Pin picker (2026-10-26).** The delivery form and the drop-off editor
+  include a Leaflet pin picker beside the typed inputs and the one-shot
+  GPS button; picking, dragging, typing, and the GPS reading all feed the
+  same coordinate fields, labeled by source (one-shot GPS reading vs
+  user-supplied).
 
 ## Live verification (not a claim — a record)
 
@@ -142,9 +151,31 @@ donated, rate-capped (~1 req/s), and carry no uptime guarantee, so they
 are not a production backend. Production use requires either a
 self-hosted OSRM/Nominatim instance (base-URL override, no code change)
 or a keyed provider behind this interface. Until one of those is in
-place, treat demo-backed routing as evaluation/low-traffic only, and
-keep the 503 unavailable state as the default (it still is: the default
-configuration ships with `MAPS_PROVIDER` empty).
+place, treat demo-backed routing as evaluation/low-traffic only. The
+local default configuration still ships with `MAPS_PROVIDER` empty (503
+unavailable state); the live Render deployment sets `osrm` via
+`render.yaml` (2026-10-26).
+
+## Google Maps adapter contract (NOT implemented — documentation only)
+
+Google Maps is not wired in: no Google adapter code exists and no key is
+stored anywhere. When the user supplies a real Google Cloud key (which
+requires a billing account), the adapter is implemented behind this same
+provider interface with no frontend rewrite:
+
+- Server side: implement `geocode` + `route` against the Google Geocoding
+  and Routes/Directions APIs; the server key comes from a server-side env
+  var only (never in the frontend, never in logs, never in error
+  responses).
+- Browser side: the Maps JavaScript API replaces the Leaflet tile layer
+  for the rendered map, and Places Autocomplete replaces the
+  type-and-search geocoding (Nominatim forbids search-as-you-type, so
+  autocomplete is a Google-only feature); the browser key must be
+  HTTP-referrer-restricted to the app's origins and documented here
+  with its restrictions before it ships.
+- The OSM adapter stays as the fallback. Nothing here is a promise of
+  Google data: until a real key exists, all maps and routing are the
+  free OSM stack above.
 
 ## Tests
 

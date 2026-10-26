@@ -74,6 +74,56 @@ export const schemas = {
     code: z.string().regex(/^\d{6}$/),
   }),
   dispute: z.object({ reason: z.string().trim().min(1).max(500) }),
+  // Marketplace delivery requests (Phase 1). Body keys are camelCase, as
+  // elsewhere; price is integer minor units (BDT paisa-equivalent), nullable.
+  createDeliveryRequest: z.object({
+    conversationId: uuid,
+    targetId: uuid,
+    title: z.string().trim().min(1).max(60),
+    description: z.string().trim().min(1).max(1000),
+    priceMinor: z.number().int().min(0).max(100_000_000).optional().nullable(),
+    note: z.string().trim().max(500).optional().nullable(),
+  }),
+  updateDeliveryRequest: z.object({
+    title: z.string().trim().min(1).max(60).optional(),
+    description: z.string().trim().min(1).max(1000).optional(),
+    priceMinor: z.number().int().min(0).max(100_000_000).optional().nullable(),
+    note: z.string().trim().max(500).optional().nullable(),
+  }).refine((o) => Object.keys(o).length > 0, 'Nothing to update'),
+  deliverySettings: z.object({
+    enabled: z.boolean().optional(),
+    allowRequests: z.string().trim().min(1).max(40).optional(),
+  }).refine((o) => Object.keys(o).length > 0, 'Nothing to update'),
+  // Drop-off pin. Coordinates are user-supplied unless the caller explicitly
+  // says they came from the one-shot GPS reading (dropoffCoordSource: 'gps');
+  // a coarse area string is never turned into coordinates.
+  dropoff: z.object({
+    dropoffLat: z.number().min(-90).max(90),
+    dropoffLng: z.number().min(-180).max(180),
+    dropoffArea: z.string().trim().min(1).max(60).optional(),
+    dropoffPhotoFileId: uuid.optional().nullable(),
+    dropoffCoordSource: z.enum(['user-supplied', 'gps']).optional().default('user-supplied'),
+  }),
+  handover: z.object({ code: z.string().regex(/^\d{6}$/) }),
+  // ---- 005: community hub / transaction flow / trust ----
+  pinMessage: z.object({ messageId: uuid }),
+  groupRules: z.object({ rules: z.string().trim().max(1000) }),
+  transferOwnership: z.object({ newOwnerId: uuid, confirm: z.literal(true) }),
+  memberRole: z.object({ role: z.enum(['admin', 'moderator', 'member']) }),
+  createInvite: z.object({
+    expiresAt: z.string().datetime({ offset: true }).optional().nullable(),
+    maxUses: z.number().int().min(1).max(10000).optional().nullable(),
+  }),
+  joinByCode: z.object({ code: z.string().trim().min(1).max(32) }),
+  messageReaction: z.object({ emoji: z.string().trim().min(1).max(20) }),
+  shareLocation: z.object({
+    lat: z.number().min(-90).max(90),
+    lng: z.number().min(-180).max(180),
+  }),
+  deliveryRating: z.object({
+    stars: z.number().int().min(1).max(5),
+    comment: z.string().trim().max(500).optional().nullable(),
+  }),
   report: z.object({
     targetType: z.enum(['message', 'user', 'delivery']),
     targetId: uuid,
